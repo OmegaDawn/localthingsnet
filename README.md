@@ -39,6 +39,11 @@ c.sendMsg("s.help()")
 data = c.sendRequest(c.clientsocks[s.addr[1]], 'Serverdata')
 ```
 
+
+---
+## Requirements
+See [requirements.txt](requirements.txt) for a list of required python packages.
+
 ---
 ## License
 GNU General Public License v3.0

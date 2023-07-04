@@ -23,7 +23,7 @@ For usage examples refer to the `demonstration notebooks and summaries`_
 ---
 Documentation Information
 -------------------------
-The documentation style is based on `numpydoc`_ style. Words embedded in
+The documentation style is based on `_numpy_doc`_ style. Words embedded in
 single asterisk refer to proper names of entities. Code snippets are
 indicated by three greater-than signs:
 
@@ -52,7 +52,7 @@ It is assumed that the following instances are/get initialized:
 
 .. _socket:
    https://docs.python.org/3/library/socket.html
-.. _numpydoc:
+.. _numpy_doc:
     https://numpydoc.readthedocs.io/en/latest/format.html
 .. _project repository:
     https://github.com/OmegaDawn/localthingsnet
@@ -64,6 +64,7 @@ It is assumed that the following instances are/get initialized:
 from pickle import PicklingError, UnpicklingError, dumps, loads
 from socket import socket, AF_INET, SOCK_DGRAM, SOCK_STREAM
 from typing import Optional, Callable, Iterable, Any
+from contextlib import suppress
 from threading import enumerate as thread_enumerate
 from threading import Thread
 from itertools import count
@@ -74,8 +75,8 @@ from re import compile
 from os import system
 
 
-__version__ = '1.0.0'
-__date__ = '2022/12/29'
+__version__ = '1.1.0'
+__date__ = '2023/07/04'
 __author__ = 'Laurenz Nitsche'
 
 
@@ -138,7 +139,7 @@ class Client:
     _connecting : bool
         Client is executing a *connect()* call
     _connecttime : float
-        Time the client connected to a server
+        Time the client established a connection to a server
     _conntype : str
         Application type of the client
     _log : list[str]
@@ -180,7 +181,7 @@ class Client:
     >>> c.disconnect()
     """
 
-    __version__ = '6.26.136'
+    __version__ = '6.27.136'
 
     def __init__(self, username: str = '', description: str = "None",
                  logfile: str = '', ansi: bool = True):
@@ -224,7 +225,7 @@ class Client:
         self._starttime: float = time()
         self._connecttime: float = 0.0
         self._connecting: bool = False
-        self._conntype = 'CLIENT'
+        self._conntype: str = 'CLIENT'
 
         # Variables that get set with a connection
         self.connected: bool = False
@@ -233,7 +234,7 @@ class Client:
         self._cl_sep: str = ''
         self.layer: int = 0
 
-        # Getting the ip with gethostname() doesn't work for raspberry
+        # Getting the ip with `gethostname()` doesn't work for raspberry
         s = socket(AF_INET, SOCK_DGRAM)
         s.connect(('1.1.1.1', 1))
         self.ip: str = s.getsockname()[0]
@@ -433,7 +434,7 @@ class Client:
         else:
             raise NameError(f"No ClientRequestable named '{name}'")
 
-    def execClientCommand(self, received_socket: socket, command: str,
+    def _execClientCommand(self, received_socket: socket, command: str,
                           args: list[object]):
         """Executes a clientcommand sent by the server.
 
@@ -462,7 +463,7 @@ class Client:
         --------
         >>> c.newClientCommand('print_text', lambda text: print(text))
         >>> sock = c._clientsocks[4000]  # Port to a connected socket
-        >>> c.execClientCommand(sock, 'print_text', ["Hello World!"])
+        >>> c._execClientCommand(sock, 'print_text', ["Hello World!"])
         """
 
         if command not in self.cl_commands:
@@ -568,6 +569,130 @@ class Client:
     # Connect and communication methods |
     # ----------------------------------+
 
+    def searchServer(self, ports: int | Iterable[int] = range(4000, 4010),
+                     ips: str  | Iterable[str] = 'locals',
+                     only_one: bool = False, add_to_autoconnect: bool = True,
+                     timeout: float = 0.1, log_info: bool = False
+                     ) -> list[tuple[str, int]]:
+        """Searches for active servers in the same network.
+
+        ...
+
+        Uses the **ips** (or the machine ip by default) and **ports**
+        and searches for active servers on any combination of those
+        addresses. This happens by uses a modified `Client` as a
+        *Serverfinder* which checks *serversocks* and ignores
+        *datasocks* and addresses without compatible server. The found
+        addresses can be returned and stored for *autoconnect* attempts.
+
+        ---
+        Parameters
+        ----------
+        ports : Iterable[int]
+            Ports that get checked for servers
+        ips : Iterable[str] | str, optional
+            Search on these ip addresses
+        only_one : bool, optional
+            Return after the first server is found
+        add_to_autoconnect: bool, optional
+            Automatically save addresses for *autoconnect* attempts
+        timeout: float, optional
+            Timeout for the search
+        log_info : bool, optional
+            Log information about tried addresses and found server
+
+        ---
+        Returns
+        -------
+        list[tuple[str, int]] : Addresses (ip, port) of found servers
+
+        ---
+        Notes
+        -----
+        -By default *(ips='locals')* the private local network is
+        searched. This may take a few seconds to go though all ports on
+        256 IP addresses. It is recommended to use the **ips** parameter
+        to narrow the search range to only a few IPs.
+        - With **add_to_autoconnect** the found server addresses will
+        become "known addresses". When `connect(autoconnect=True)` is
+        called the server tries to connect to any of these previously
+        found addresses.
+        - *serversocks* are the mainly used socket of servers and
+        *datasocks* are secondary sockets for data transfer.
+        - Increasing the timeout drastically increases the search time.
+
+        ---
+        Examples
+        --------
+        >>> # Two server are bound to port 4000 and 4001
+        >>> c.searchForServer(range(4000, 4010), only_one=True)
+        [('192.168.178.140', 4000)]
+
+        >>> c.searchForServer(ports=[4000, 4001], ips=['192.168.178.140'])
+        [('192.168.178.140', 4000), ('192.168.178.140', 4001)]
+
+        >>> c.searchForServer((4000, 4001), log_info=True)
+        Found Server on 192.168.178.140 at 4000  # In logfile
+        Found Server on 192.168.178.140 at 4001
+        [('192.168.178.140', 4000), ('192.168.178.140', 4001)]
+        """
+
+        if isinstance(ports, int):
+            ports = [ports]
+        if isinstance(ips, str):
+            ips = [ips]
+
+        # Thread that searches for servers on a certain port
+        def searchPortOnAddress(for_ips, on_port):
+            def mute(client, message): pass
+            c = Client()
+            c._conntype = 'SERVERFINDER'
+            c.printInfo = mute.__get__(c, Client)
+            c.statusInfo = mute.__get__(c, Client)
+            c.warningInfo = mute.__get__(c, Client)
+            c.errorInfo = mute.__get__(c, Client)
+            for ip in for_ips:
+                if only_one and len(found_servers) > 0:
+                    return
+                info = c.connect((ip, on_port), autoconnect=False,
+                                 timeout=timeout)
+                if only_one and len(found_servers) > 0:
+                    return
+                if info == 1:
+                    found_servers.append((ip, on_port))
+                    if log_info:
+                        self.statusInfo(f"Found Server on {ip} at {on_port}")
+
+        found_servers = []
+        threads = []
+        if isinstance(ips, str):
+            ips = [ips]
+        elif not isinstance(ips, list):
+            ips = list(ips)
+        if ips == ['locals']:
+            ip_base = self.ip[::-1].split('.', 1)[1][::-1]
+            ips = [f'{ip_base}.{e}' for e in range(256)]
+        if log_info:
+            self.statusInfo(
+                "Searching for " + ("a server" if only_one else "servers")
+                + f" on {len(ips)} {'IPs' if len(ips) > 1 else 'IP'}"
+                + f" at {len(ports)} "
+                + f"{'ports' if len(ports) > 1 else 'port'}.")
+
+        for port in ports:
+            threads.append(Thread(target=searchPortOnAddress,
+                                            args=(ips, port,),
+                                            name=f'Search_{port}'))
+            threads[-1].start()
+
+        for thread in threads:
+            thread.join()
+        if add_to_autoconnect:
+            for addr in found_servers:
+                if addr not in self.autoconnect_addrs:
+                    self.autoconnect_addrs.append(addr)
+        return found_servers
+
     def disconnect(self):
         """Terminates a connection.
 
@@ -585,7 +710,7 @@ class Client:
         """
 
         servername = self.cl_serverdata['servername'] if 'servername' in \
-            self.cl_serverdata else ''
+                self.cl_serverdata else ''
         self.connected = False
         self._connecting = False
         self.connected_addr = ('', -1)
@@ -597,13 +722,12 @@ class Client:
         started = time()
         # Disconnect all socket (through this loop or receiving threads)
         while len(self.clientsocks) > 0:
-            try:
+            # NOTE: The socket can als be removed by a receiving thread
+            # in this case no action is required.
+            with suppress(ValueError, KeyError):
                 sock = self.clientsocks[list(self.clientsocks.keys())[0]]
                 del self.clientsocks[self.getPort(sock)]
                 sock.close()
-            # Socket got removed by a receiving thread
-            except (ValueError, KeyError):
-                pass
             if time() - started > 1.5:
                 self.errorInfo("Failed to correctly disconnect the client")
                 return
@@ -613,18 +737,109 @@ class Client:
             else:
                 self.statusInfo("Disconnected from Server")
 
+    def _setup_connect(func: callable):
+        """Decorator that sets up things before connecting to a server.
+
+        ...
+
+        The setup validates the address and prevents multiple connection
+        attempts at the same time. It then executes the connect `func`
+        and registers the client. A returned message states the success
+        or failure of the connect attempt.
+
+        ---
+        Returns
+        -------
+        int : Status result of the connect attempt:
+            `-2` : No server on address(es)
+            `-1` : Timeout
+             `0` : Already connecting / No address(es) to connect to
+             `1` : Registration failed / Can't interact with server
+             `2` : Success / connected
+
+        ---
+        See Also
+        --------
+        connect : Connects the client to given address
+        autoConnect : Tries to connect to any of the already known addrs
+        """
+
+        def inner(self, addr: tuple[str, int] = (), timeout: float=0.5,
+                  await_maindatasock: bool = True,
+                  *args, **kwargs) -> int:
+            kwargs['timeout'] = timeout
+            kwargs['addr'] = addr
+
+            # Preparation
+            if not addr:
+                addr = ('', -1)
+                # Preparation
+            if not addr:
+                addr = ('', -1)
+            if self._connecting:
+                self.statusInfo("Already connecting")
+                return 0
+            if self.connected:
+                self.disconnect()
+            self._connecting = True
+
+            # Connect attempt by function call
+            sock = func(self, *args, **kwargs)
+            if isinstance(sock, int):
+                self._connecting = False
+                return sock  # Return failure status of connect function
+
+            # Registration
+            f = self._registration(sock)
+            if not f:
+                self.disconnect()
+                self.statusInfo("Registration failed")
+                return 1
+
+            # Connected
+            self.connected = True
+            self._connecting = False
+            self._connecttime = time()
+            self.clientsocks[addr[1]] = sock
+            self.connected_addr = sock.getpeername()
+            Thread(target=self.recvServerMessage, name='Recv_Server').start()
+            self.statusInfo(f"Connected with {self.connected_addr}")
+            sock.send('continue'.encode())  # Ends server side registration
+
+            # Add addr to autoconnect
+            if not [entry for entry in self.autoconnect_addrs \
+                    if entry is self.connected_addr]:
+                self.autoconnect_addrs.append((
+                    self.connected_addr[0],
+                    self.connected_addr[1]))
+
+            # Await maindatasock (if available)
+            socknames = [sock[0] for sock in self.cl_serverdata['socks']]
+            if await_maindatasock and 'Maindata' in socknames:
+                starttime = time()
+                while len(self.clientsocks) == 1:
+                    if time() - starttime > timeout:
+                        self.warningInfo(
+                            "Maindatasock dit not get connected in time")
+                        break
+            self.statusInfo("Connected and registered")
+            return 2  # Success
+        return inner
+
+    @_setup_connect
     def connect(self, addr: tuple[str, int] = (),  # type: ignore
-                autoconnect: bool = False, timeout: float = 0.5) -> str:
+                autoconnect: bool = False, timeout: float = 0.5,
+                *args, **kwargs) -> int | socket:
         """Connects the client with a server.
 
         ...
 
         Connects the client either through an inputted address *(direct
         connect)* or tries addresses that knowingly are/were used by
-        servers *(autoconnect)*. If an address holds a server, a
-        registration protocol is carried out to ensue compatibility
-        between client and server. After that a *receiving thread* is
-        started to receive data from the *serversock*.
+        servers *(autoconnect)*.
+        The function is wrapped in a decorator which sets up the
+        connection process and registrate the client if a connection
+        could be established.
 
         ---
         Parameters
@@ -639,130 +854,270 @@ class Client:
         ---
         Returns
         -------
-        str : Returns one of the following states:
-            - 'Connected'
-            - 'Already connecting'
-            - 'No Server on this address'
-            - 'Server refused Connection'
-            - 'Address is unsuited for client'
-            - 'No IPs for autoconnect listed'
-            - 'Timeout'
+        socket : Connected socket if successful
+        int : Status result of the connect attempt:
+            `-2` : No server on address(es)
+            `-1` : Timeout
+             `0` : Already connecting / No address(es) to connect to
+             `1` : Registration failed
+             `2` : Success, connected
 
         ---
         See Also
         --------
-        searchForServer : Searches for active server
-        registration : Registration protocol
-        recvServerData : Receiving thread for a connected socket
+        autoConnect : Parameter less connect to a server
+        searchForServer : Searches server to use for autoconnect
+        _setup_connect : Decorator to set up things for connecting
 
         ---
         Notes
         -----
         - Addresses of known servers for *autoconnect* can be gained
         with `searchForServer()` and are stored in `autoconnect_addrs`.
-        - A receiving thread is a thread that receives and evaluates
-        data on a connected socket.
+        - Direct connect can not lead to a timeout error.
 
         ---
         Examples
         --------
         >>> c.connect(autoconnect=True)
 
-        >>> c.connect(('192.168.178.140', 4000))
+        >>> c.connect(('192.168.178.140', 4000), timeout=1.5)
 
-        >>> c.connect(('192.168.178.140', 4001), True, 1.5)
+        >>> c.connect(addr=('192.168.178.140', 4001), autoconnect=True)
         """
 
-        # Preparation
+        # Checks
         if not addr:
             addr = ('', -1)
-        if self._connecting:
-            self.statusInfo("Already connecting")
-            return 'Already connecting'
-        if len(self.autoconnect_addrs) == 0 and autoconnect \
-        and addr == ('', -1):
-            self.statusInfo("No IPs for autoconnect")
-            return 'No IPs for autoconnect listed'
-
         if addr == ('', -1) and not autoconnect:
-            self.warningInfo("No address for connect provided")
-        if self.connected:
-            self.disconnect()
-        self._connecting = True
-        self.clientsocks[addr[1]] = socket()  # User socket
+            self.stausInfo("No address provided and autoconnect disabled")
+            return 0
 
         # Direct connect
-        if addr != ('', -1):
-            try:
-                self.statusInfo(f"Connecting to {addr[0]}")
-                self.clientsocks[addr[1]].settimeout(timeout)
-                self.clientsocks[addr[1]].connect((addr[0], int(addr[1])))
-                self.clientsocks[addr[1]].settimeout(None)
-                self.connected_addr = addr
-                self.connected = True
-            except OSError:
+        sock = socket()
+        sock.settimeout(timeout)
+        try:
+            if addr != ('', -1):
+                self.statusInfo(f"Connecting to {addr}")
+                sock.connect((addr[0], int(addr[1])))
+                sock.settimeout(None)
+                # Socket is connected (otherwise exception is raised)
+                sock.getpeername()
+                return sock
+        except (OSError, TimeoutError) as error:
+            if autoconnect:
+                self._connecting = False  # Needed bc autoconnect has decorator
+                return self.autoConnect(timeout=timeout)
+            if error == TimeoutError:
+                self.stuatusInfo(
+                    f"Timeout {timeout} while connecting to {addr}")
+                return -1
+            else:
                 self.statusInfo("No server found")
-                if autoconnect:
-                    self.clientsocks[addr[1]].settimeout(None)
-                else:
-                    del self.clientsocks[addr[1]]
-                    self.disconnect()
-                    return 'No Server on this address'
+                return -2
 
-        # Autoconnect
-        if autoconnect and not self.connected:
-            self.statusInfo("Starting autoconnect")
-            for addr in self.autoconnect_addrs:
-                Thread(
-                    target=self._checkAddr,
-                    args=(addr,),
-                    name=f'checkAddr_{addr[0]}'
-                ).start()
+    @_setup_connect
+    def autoConnect(self, timeout=0.5, *args, **kwargs) -> int | socket:
+        """Connects the client to any of the known server addresses.
+
+        ...
+
+        The Client starts multiple connect attempts in parallel for all
+        addresses in the `autoconnect_addrs` list. The first server that
+        accepts the client is used. It is non-deterministic which
+        address will be connected to and therefore autoconnect should
+        be used if it doesn't matter which server is used.
+
+        ---
+        Parameters
+        ----------
+        timeout : float, optional
+            Seconds after which the connect attempt is abandoned
+
+        ---
+        Returns
+        -------
+        socket : Connected socket if successful
+        int : Status result of the connect attempt:
+            `-2` : No server on address(es)
+            `-1` : Timeout
+             `0` : Already connecting / No address(es) to connect to
+             `1` : Registration failed
+             `2` : Success, connected
+
+        ---
+        See Also
+        --------
+        connect : Connect the client to a server
+        _setup_connect : Decorator to set up things for connecting
+        _checkAddr : Checks if a server is available at an address
+
+        ---
+        Notes
+        -----
+        - During the process multiple 'check' threads are started, one
+        for each address in `autoconnect_addrs`.
+
+        ---
+        Examples
+        --------
+        >>> c.autoConnect()
+
+        >>> c.autoConnect(timeout=1.5)
+        """
+
+        if len(self.autoconnect_addrs) == 0:
+            self.statusInfo("No IPs for autoconnect")
+            return 0
+
+        self.statusInfo("Starting autoconnect")
+        for addr in self.autoconnect_addrs:
+            Thread(
+                target=self._checkAddr,
+                args=(addr,),
+                name=f'checkAddr_{addr[0]}'
+            ).start()
 
         # Wait for connection (or timeout)
         started = time()
         while not self.connected:
             if time() - started >= timeout:
-                if autoconnect:
+                if len(self.clientsocks) == 1:
                     del self.clientsocks[addr[1]]
-                self.disconnect()
                 self.statusInfo(
-                    f"Timeout({timeout} secs) while waiting for a connection")
-                return 'Timeout'
+                    f"Timeout ({timeout} secs) while waiting for a connection")
+                return -1
             sleep(0.0001)
+        return self.clientsocks[addr[1]]
 
-        # Connected but registering
-        self.statusInfo(f"Connected with {self.connected_addr[0]} at "
-                        + f"{self.connected_addr[1]}")
+    def _checkAddr(self, addr: tuple[str, int], timeout=0.25):
+        """Tries to connect a `socket` to an address.
+
+        ...
+
+       Simply connects a `socket` object to an address and handles
+       connect success and failure. Used to speed up an *autoconnect* of
+       `connect()`.
+
+        ---
+        Parameters
+        ----------
+        addr : tuple[str, int]
+            Address (ip, port) to check
+        timeout : float, optional
+            Seconds after which the check is abandoned
+
+        ---
+        See Also
+        --------
+        connect : Connects the client to a server
+
+        ---
+        Notes
+        -----
+        - This is not an equivalent to the `connect()`. method.
+        - The *autoconnect* option of `connect()` tries to connect to an
+        already known server address without entering the address again.
+        """
+
+        checksock = socket()
         try:
-            self.registration()
+            if not self.connected and self._connecting:
+                self.statusInfo(f"Connecting to {addr}")
+                checksock.settimeout(timeout)
+                checksock.connect((addr[0], int(addr[1])))
+                if not self.connected and self._connecting:
+                    self.connected_addr = addr
+                    self.connected = True
+                    self.clientsocks[addr[1]] = checksock
+                    self.clientsocks[addr[1]].settimeout(None)
+            else:
+                checksock.close()
+        except OSError:
+            del checksock
+
+    def _registration(self, sock: socket) -> bool:
+        """Check compatibility and exchange metadata when connecting.
+
+        ...
+
+        Client and Server exchange a few information to check if they
+        are compatible. If so additional metadata will be exchanged.
+        The server and client must call their registration functions
+        simultaneously. If all registration exchanges are successful,
+        the main receiving thread is started.
+
+        ---
+        Parameters
+        ----------
+        sock : socket
+            Socket to exchange data with
+
+        ---
+        Returns
+        -------
+        bool : Registration was successful
+
+        ---
+        Raises
+        ------
+        TimeoutError : Unsuited socket type (handled by `[auto-]connect()`)
+        ConnectionError : Large clientdata (handled by `[auto-]connect()`)
+
+        ---
+        See Also
+        --------
+        connect : Connect the client to a (specific) server-address
+        autoConnect : Connect the client to any of the 'known' addresses
+
+        ---
+        Notes
+        -----
+        - After the registration the server is in a state where it
+        awaits a 'continue' from the **sock**. This is so that the
+        client can finish connecting until the normal data transmission
+        starts. For that use `sock.send('continue'.encode())` whenever
+        the connecting process is finished.
+        """
+
+        addr = sock.getpeername()
+        try:
+            # Validate socke type
+            sock.send('clientsocket'.encode())
+            sock.settimeout(0.5)
+            s = sock.recv(32).decode()
+            if s != 'suited socket type':
+                raise TimeoutError
+            sock.settimeout(None)
+
+            # Check version
+            sock.send(f'{self._conntype}|{Client.__version__}'.encode())
+
+            # Exchange serverdata
+            self.cl_serverdata = loads(sock.recv(4096))
+            self.layer = self.cl_serverdata['layer'] + 1
+            self._cl_sep = self.cl_serverdata['separator']
+            self.cl_max_datasize = self.cl_serverdata['max_datasize']
+
+            # Exchange clientdata
+            binary_clientdata = dumps(self.getClientData())
+            if len(binary_clientdata) > 4096:
+                self.errorInfo(
+                    "Clientdata is larger than 4096 bytes")
+                raise ConnectionError
+            sock.send(binary_clientdata)
+
+            # Set username
+            self.username = sock.recv(
+                self.cl_serverdata['max_username_length']).decode()
+            return True
+
         except (ConnectionError, ConnectionResetError, EOFError):
             self.statusInfo("Registration failed")
-            self.disconnect()
-            return 'Server refused Connection'
+            return False
         except TimeoutError:
-            self.statusInfo(
-                f"Address {self.connected_addr} is unsuited for this client")
-            self.disconnect()
-            return 'Address is unsuited for client'
-        self._connecttime = time()
-        self._connecting = False
-
-        if not [entry for entry in self.autoconnect_addrs \
-                if entry is self.connected_addr]:
-            self.autoconnect_addrs.append((
-                self.connected_addr[0],
-                self.connected_addr[1]))
-
-        # Wait for maindatasock to get connected
-        # (ensures that scripts can use the maindatasock)
-        starttime = time()
-        socknames = [sock[0] for sock in self.cl_serverdata['socks']]
-        while len(self.clientsocks) == 1 and 'Maindata' in socknames:
-            if time() - starttime > 1.5:
-                self.warningInfo("Maindatasock did not get connected")
-                break
-        return 'Connected'
+            self.statusInfo(f"Can't interact with server at '{addr}'")
+            return False
 
     def connectDatasock(self, addr: tuple[str, int],
                         recv_func: Callable = 'default'  # type: ignore
@@ -823,10 +1178,10 @@ class Client:
         new_datasock.connect(addr)
 
         try:
-            # Validate sockettype
+            # Validate socket type
             new_datasock.send('datasocket'.encode())
             new_datasock.settimeout(0.5)
-            if new_datasock.recv(32).decode() != 'suited sockettype':
+            if new_datasock.recv(32).decode() != 'suited socket type':
                 raise TimeoutError
             new_datasock.settimeout(None)
 
@@ -848,229 +1203,12 @@ class Client:
         self.statusInfo(f"Connected new datasocket to port {addr[1]}")
         return new_datasock
 
-    def _checkAddr(self, addr: tuple[str, int]):
-        """Tries to connect a `socket` to an address.
-
-        ...
-
-       Simply connects a `socket` object to an address and handles
-       connect success and failure. Used to speed up an *autoconnect* of
-       `connect()`.
-
-        ---
-        Parameters
-        ----------
-        addr : tuple[str, int]
-            Address (ip, port) to check
-
-        ---
-        See Also
-        --------
-        connect : Connects the client to a server
-
-        ---
-        Notes
-        -----
-        - This is not an equivalent to the `connect()`. method.
-        - The *autoconnect* option of `connect()` tries to connect to an
-        already known server address without entering the address again.
-        """
-
-        checksock = socket()
-        try:
-            if not self.connected and self._connecting:
-                self.statusInfo(f"Trying to connect to {addr[0]} at {addr[1]}")
-                checksock.settimeout(0.2)
-                checksock.connect((addr[0], int(addr[1])))
-                if not self.connected and self._connecting:
-                    self.connected_addr = addr
-                    self.connected = True
-                    self.clientsocks[addr[1]] = checksock
-                    self.clientsocks[addr[1]].settimeout(None)
-            else:
-                checksock.close()
-        except OSError:
-            del checksock
-
-    def searchServers(self, ports: list[int] | tuple[int, ...],
-                      ips: list[str] | tuple[str, ...] | str = 'locals',
-                      only_one: bool = False, add_to_autoconnect: bool = True,
-                      log_info: bool = False) -> list[tuple[str, int]]:
-        """Searches for active servers in the same network.
-
-        ...
-
-        Uses the **ips** (or the machine ip by default) and **ports**
-        and searches for active servers on any combination of those
-        addresses. This happens by uses a modified `Client` as a
-        *Serverfinder* which checks *serversocks* and ignores
-        *datasocks* and addresses without compatible server. The found
-        addresses can be returned and stored for *autoconnect* attempts.
-
-        ---
-        Parameters
-        ----------
-        ports : Iterable[int]
-            Ports that get checked for servers
-        ips : Iterable[str] | str, optional
-            Search on these ip addresses
-        only_one : bool, optional
-            Return after the first server is found
-        add_to_autoconnect: bool, optional
-            Automatically save addresses for *autoconnect* attempts
-        log_info : bool, optional
-            Log information about tried addresses and found server
-
-        ---
-        Returns
-        -------
-        list[tuple[str, int]] : Addresses (ip, port) of found servers
-
-        ---
-        Notes
-        -----
-        -By default *(ips='locals')* the private local network is
-        searched. This may take a few seconds to go though all ports on
-        256 IP addresses. It is recommended to use the **ips** parameter
-        to narrow the search range to only a few IPs.
-        - With **add_to_autoconnect** the found server addresses will
-        become "known addresses". When `connect(autoconnect=True)` is
-        called the server tries to connect to any of these previously
-        found addresses.
-        - *serversocks* are the mainly used socket of servers and
-        *datasocks* are secondary sockets for data transfer.
-
-        ---
-        Examples
-        --------
-        >>> # Two server are bound to port 4000 and 4001
-        >>> c.searchForServer(range(4000, 4010), only_one=True)
-        [('192.168.178.140', 4000)]
-
-        >>> c.searchForServer(ports=[4000, 4001], ips=['192.168.178.140'])
-        [('192.168.178.140', 4000), ('192.168.178.140', 4001)]
-
-        >>> c.searchForServer((4000, 4001), log_info=True)
-        Found Server on 192.168.178.140 at 4000  # In logfile
-        Found Server on 192.168.178.140 at 4001
-        [('192.168.178.140', 4000), ('192.168.178.140', 4001)]
-        """
-
-        if isinstance(ports, int):
-            ports = [ports]
-        if isinstance(ips, str):
-            ips = [ips]
-
-        # Thread that searches for servers on a certain port
-        def searchPortOnAddress(for_ips, on_port):
-            def mute(client, message): pass
-            c = Client()
-            c._conntype = 'SERVERFINDER'
-            c.printInfo = mute.__get__(c, Client)
-            c.statusInfo = mute.__get__(c, Client)
-            c.warningInfo = mute.__get__(c, Client)
-            c.errorInfo = mute.__get__(c, Client)
-            for ip in for_ips:
-                if only_one and len(found_servers) > 0:
-                    return
-                info = c.connect((ip, on_port), False, 0.01)  # May be to short
-                if only_one and len(found_servers) > 0:
-                    return
-                if info == 'Server refused Connection':
-                    found_servers.append((ip, on_port))
-                    if log_info:
-                        self.statusInfo(f"Found Server on {ip} at {on_port}")
-
-        found_servers = []
-        threads = []
-        if isinstance(ips, str):
-            ips = [ips]
-        elif not isinstance(ips, list):
-            ips = list(ips)
-        if ips == ['locals']:
-            ip_base = self.ip[::-1].split('.', 1)[1][::-1]
-            ips = [f'{ip_base}.{e}' for e in range(256)]
-        if log_info:
-            self.statusInfo(
-                "Searching for " + ("a server" if only_one else "servers")
-                + f" on {len(ips)} {'IPs' if len(ips) > 1 else 'IP'}"
-                + f" at {len(ports)} "
-                + f"{'ports' if len(ports) > 1 else 'port'}.")
-
-        for port in ports:
-            threads.append(Thread(target=searchPortOnAddress,
-                                            args=(ips, port,),
-                                            name=f'Search_{port}'))
-            threads[-1].start()
-
-        for thread in threads:
-            thread.join()
-        if add_to_autoconnect:
-            for addr in found_servers:
-                if addr not in self.autoconnect_addrs:
-                    self.autoconnect_addrs.append(addr)
-        return found_servers
-
-    def registration(self):
-        """Check compatibility and exchange metadata when connecting.
-
-        ...
-
-        ---
-        Raises
-        ------
-        TimeoutError : Unsuited sockettype (handled by `connect()`)
-        ConnectionError : Large clientdata (handled by `connect()`)
-
-        ---
-        See Also
-        --------
-        connect : Connect the client to a server
-        """
-
-        sock = self.clientsocks[self.connected_addr[1]]
-
-        # Validate sockettype
-        sock.send('clientsocket'.encode())
-        sock.settimeout(0.5)
-        s = sock.recv(32).decode()
-        if s != 'suited sockettype':
-            raise TimeoutError
-        sock.settimeout(None)
-
-        # Check version
-        sock.send(f'{self._conntype}|{Client.__version__}'.encode())
-
-        # Exchange serverdata
-        self.cl_serverdata = loads(sock.recv(4096))
-        self.layer = self.cl_serverdata['layer'] + 1
-        self._cl_sep = self.cl_serverdata['separator']
-        self.cl_max_datasize = self.cl_serverdata['max_datasize']
-
-        # Exchange clientdata
-        binary_clientdata = dumps(self.getClientData())
-        if len(binary_clientdata) > 4096:
-            self.errorInfo(
-                "Clientdata is larger than 4096 bytes and connect will fail")
-            raise ConnectionError
-        sock.send(binary_clientdata)
-
-        # Set username
-        self.username = sock.recv(
-            self.cl_serverdata['max_username_length']).decode()
-
-        # Start data receiver and inform server
-        Thread(target=self.recvServerMessage,
-                         name='Recv_Server'
-        ).start()
-        sock.send('continue'.encode())
-
     def recvServerMessage(self):
         """Receives data from the serversock.
 
         ...
 
-        Essentially a wrapper for ´recvServerData´ that disconnects the
+        Essentially a wrapper for `recvServerData()` that disconnects the
         whole client if the connection fails.
 
         ---
@@ -1170,11 +1308,11 @@ class Client:
                                 self.sendData(sock, ['<$REQUEST$>', 'answer',
                                               data[2], None])
                                 continue
-                            requesteddata = self.cl_requestables.get(data[3])
-                            if callable(requesteddata):
-                                requesteddata = requesteddata()
+                            requested_data = self.cl_requestables.get(data[3])
+                            if callable(requested_data):
+                                requested_data = requested_data()
                             self.sendData(sock, ['<$REQUEST$>', 'answer',
-                                                 data[2], requesteddata])
+                                                 data[2], requested_data])
                         elif data[1] == 'answer':  # Answer for client request
                             if data[2] in self._open_requests:
                                 self._open_requests[data[2]] = data[3]
@@ -1187,7 +1325,7 @@ class Client:
 
                     # Process clientcommand
                     elif isinstance(data, list) and data[0] == '<$COMMAND$>':
-                        self.execClientCommand(sock, data[1], data[2])
+                        self._execClientCommand(sock, data[1], data[2])
 
                     # Display on console if data is text
                     elif isinstance(data, str):
@@ -1757,7 +1895,7 @@ class Server:
     _open_requests : dict
         Unanswered requests to get data from a client socket
         dict[id:str, request_or_data:Any]
-    _restricted_usernames : list[str]
+    RESTRICTED_NAMES : list[str]
         Names that are not allowed as usernames
 
     ---
@@ -1859,7 +1997,8 @@ class Server:
                  adminkey: str = '', max_datasize: int = 1024,
                  preferredport: int | str | Iterable[int]=  '>4000',
                  preferreddataport: int | str | Iterable[int] = '<3999',
-                 logfile: str = '', ansi: bool = True, *args, **kwargs):
+                 startserver: bool = False, logfile: str = '',
+                 ansi: bool = True,*args, **kwargs):
         """...
 
         ---
@@ -1877,6 +2016,8 @@ class Server:
             Allowed ports to bind the server to
         preferreddataport : int | str | Iterable[int], optional
             Allowed ports to bind datasocks to
+        startserver : bool, optional
+            Start server with preferred settings after initialization
         logfile : str, optional
             Path to file that stores all events
         ansi : bool, optional
@@ -1929,9 +2070,6 @@ class Server:
             list[str], str, str, str]] = {}
         self._open_requests: dict[str, Any] = {}
         self.se_requestables: dict[str, object] = {}
-        self._restricted_usernames: list[str] = ['command' 'commands',
-            'servercommand', 'servercommands', 'info', 'requestables',
-            'services', 'server', 'subserver', 'mainserver', 'higher']
         self.addr: tuple[str, int] = ('', -1)
         self._min_username_length: int = 2
         self._max_username_length: int = 16
@@ -1977,6 +2115,9 @@ class Server:
                     + " '<', '>' or '=' at the FIRST position")
         self.logEvent(f"Server ({Server.__version__}) loaded")
 
+        if startserver:
+            self.startServer()
+
     def startServer(self, port: int | str | Iterable[int] = 'preferred',
                     dataport: int | str | Iterable = 'preferred',
                     maindatasock: bool = False, services: bool = True):
@@ -1986,10 +2127,10 @@ class Server:
 
         Binds the serversock to an available allowed port in **port**.
         After this clients will be able to connect to the server. If
-        needed, the maindatasock for background interactions can be
-        initialized and bound to a port in **dataport**. Additionally
-        services, for repetitive tasks like data synchronization can be
-        activated.
+        needed, the **maindatasock** for background interactions can be
+        initialized. It will be bound to a port within **dataport**.
+        Additionally services, for repetitive tasks like data
+        synchronization can be activated.
 
         ---
         Parameters
@@ -2340,12 +2481,12 @@ class Server:
 
         datasock.listen(10)
         self.serversocks[sockname] = (datasock, connect_new_clients, show_info)
-        sockaddr = datasock.getsockname()
+        sock_addr = datasock.getsockname()
         Thread(
             target=self._acceptSocket,
             args=(datasock, recvFunc,),
             kwargs=dict(show_info=show_info),
-            name=f'Connect_{sockaddr[1]}'
+            name=f'Connect_{sock_addr[1]}'
         ).start()
 
         # Connect clients in list
@@ -2354,7 +2495,7 @@ class Server:
                 self.sendCommandTo(
                     self.conns[clientid]['socks'][maindatasock_port],
                     'newdatasock',
-                    [sockaddr])
+                    [sock_addr])
             except KeyError:
                 self.warningInfo("Could not connect a clientid to new"
                                  + f" datasocket '{sockname}'")
@@ -2524,23 +2665,23 @@ class Server:
         connects to a server datasock the socket gets disconnected.
         """
 
-        connid = self._generateNewConnID()
-        clientaddr = client.getpeername()
+        conn_id = self._generateNewConnID()
+        client_addr = client.getpeername()
         conntype = ''
         try:
-            # Validate sockettype
+            # Validate socket type
             try:
-                client.settimeout(0.1)
+                client.settimeout(1)
                 if client.recv(32).decode() == 'clientsocket':
-                    client.send('suited sockettype'.encode())
+                    client.send('suited socket type'.encode())
                 else:
-                    client.send('unsuited sockettype'.encode())
+                    client.send('unsuited socket type'.encode())
                     raise TimeoutError
                 client.settimeout(None)
             except TimeoutError:
                 client.close()
                 self.connectionInfo(
-                    f"{clientaddr[0]} is unsuited for the server")
+                    f"{client_addr[0]} is unsuited for the server")
                 return
 
             # Check connection type and version
@@ -2548,18 +2689,18 @@ class Server:
             version = version.split('.')
             if conntype == 'SERVERFINDER':
                 self.logEvent(
-                    f"{clientaddr[0]} searches server and disconnected")
+                    f"{client_addr[0]} searches server and disconnected")
                 raise ConnectionResetError
             elif (conntype == 'CLIENT' or conntype == 'SUBSERVER') \
                     and int(version[0]) < 6 and int(version[1]) < 26:
-                self.logEvent(clientaddr[0] + " is not compatible")
+                self.logEvent(client_addr[0] + " is not compatible")
                 raise ConnectionAbortedError
 
             # Exchange serverdata
             binary_serverdata = dumps(self.getServerData())
             if len(binary_serverdata) > 4096:
                 self.errorInfo("Serverdata is larger than 4096 bytes and "
-                               + f"registering {clientaddr[0]} will fail.")
+                               + f"registering {client_addr[0]} will fail.")
                 raise ConnectionAbortedError
             client.send(binary_serverdata)
 
@@ -2572,17 +2713,17 @@ class Server:
             username_changed_info = ""
             if username == '' \
             or not 3 <= len(username) <= self._max_username_length \
-            or username.lower() in self._restricted_usernames \
+            or username.lower() in self.RESTRICTED_NAMES \
             or self.getIDof(username=username) is not None:
                 if username == '': pass
                 elif not self._min_username_length <= len(username) <= \
                 self._max_username_length \
-                or username.lower() in self._restricted_usernames:
+                or username.lower() in self.RESTRICTED_NAMES:
                     username_changed_info = f"Username '{username}' is invalid"
                 if self.getIDof(username=username) is not None:
                     username_changed_info = \
                                 f"Username '{username}' is already used"
-                username = f'unnamed_{str(connid)[:5]}'
+                username = f'unnamed_{str(conn_id)[:5]}'
             client.send(username.encode())
 
             # Await client processing registration
@@ -2591,7 +2732,7 @@ class Server:
 
         except (ConnectionResetError, ConnectionAbortedError, EOFError):
             if conntype != 'SERVERFINDER':
-                self.connectionInfo(clientaddr[0]
+                self.connectionInfo(client_addr[0]
                                     + " disconnected during registration")
             client.close()
             return
@@ -2602,7 +2743,7 @@ class Server:
             'name': username,
             'socks': {self.addr[1]: client},
             'isserver': conntype == 'SUBSERVER',  # Client is network node
-            'addr': clientaddr,
+            'addr': client_addr,
             'clientdata': clientdata,  # Metadata sent from the client
             'permissions': ['user'],
             'muted': False,
@@ -2612,7 +2753,7 @@ class Server:
                 'recv_buffer': {},  # Buffers received data per socket
                 'recv_packets': {}  # Holds incomplete data per socket
             }}
-        self.conns[connid] = conn_entry
+        self.conns[conn_id] = conn_entry
 
         # Connect serverdatasockets
         for sockname, sockdata in self.serversocks.items():
@@ -2630,26 +2771,26 @@ class Server:
                 if time() > started + 1.0:
                     break
             else:
-                self.conns[connid]['ping'] = self.pingSocket(
-                    self.mainDataSockof(connid))
+                self.conns[conn_id]['ping'] = self.pingSocket(
+                    self.mainDataSockOf(conn_id))
         else:
             started = time()
             self.sendDataTo(client, ['<$REQUEST$>', 'request', '0', 'PING'])
             client.recv(128)
-            self.conns[connid]['ping'] = time() - started
+            self.conns[conn_id]['ping'] = time() - started
 
         # Welcome text
         if username_changed_info != "":
-            self.sendMsgTo(connid, username_changed_info)
-        self.connectionInfo(f"{clientaddr[0]} is registered as '{username}'")
-        self.sendMsgTo(connid, f"Connected to {self.username}")
-        self.sendMsgTo(connid, f"Registered as '{username}'")
-        self.sendMsgTo(connid, "Type 's.help()' for more information")
+            self.sendMsgTo(conn_id, username_changed_info)
+        self.connectionInfo(f"{client_addr[0]} is registered as '{username}'")
+        self.sendMsgTo(conn_id, f"Connected to {self.username}")
+        self.sendMsgTo(conn_id, f"Registered as '{username}'")
+        self.sendMsgTo(conn_id, "Type 's.help()' for more information")
         if self.adminkey == '':
             conn_entry['permissions'].append('admin')
-            self.sendMsgTo(connid, "You have admin permissions")
+            self.sendMsgTo(conn_id, "You have admin permissions")
 
-        self.recvUserMessages(connid, client)
+        self.recvUserMessages(conn_id, client)
 
     def _registrateSocket(self, datasocket: socket,
                          serversock: socket,
@@ -2689,13 +2830,13 @@ class Server:
         """
 
         try:
-            # Validate sockettype
+            # Validate socket type
             datasocket.settimeout(0.1)
             if datasocket.recv(32).decode() != 'datasocket':
-                datasocket.send('unsuited sockettype'.encode())
+                datasocket.send('unsuited socket type'.encode())
                 raise TimeoutError
             else:
-                datasocket.send('suited sockettype'.encode())
+                datasocket.send('suited socket type'.encode())
             datasocket.settimeout(None)
         except (TimeoutError, UnicodeDecodeError):
             if show_info:
@@ -2712,16 +2853,16 @@ class Server:
         try:
             port = datasocket.getsockname()[1]
             recv = datasocket.recv(self.se_max_datasize)
-            useraddr = loads(recv)
-            userid = self.getIDof(addr=useraddr)
-            self.conns[userid]['socks'][port] = datasocket
+            user_addr = loads(recv)
+            user_id = self.getIDof(addr=user_addr)
+            self.conns[user_id]['socks'][port] = datasocket
             if show_info:
-                self.logEvent("User '" + self.conns[userid]['name']
+                self.logEvent("User '" + self.conns[user_id]['name']
                               + "' connected a new datasocket at port "
                               + str(serversock.getsockname()[1]))
             Thread(
                 target=handler,
-                args=(datasocket, userid,),
+                args=(datasocket, user_id,),
                 name='Recv_{}_{}'.format(
                     serversock.getsockname()[1],
                     datasocket.getsockname()[0].split('.')[-1])
@@ -3381,7 +3522,7 @@ class Server:
         - The new username must have a certain length in the range of
         the attributes `_min_username_length` and `max_username_length`.
         - The new username may not be a restricted username (attribute
-        `_restricted_usernames`) and may not be used by another client
+        `RESTRICTED_NAMES`) and may not be used by another client
         already.
         """
 
@@ -3391,13 +3532,13 @@ class Server:
                 + f"{self._max_username_length} characters")
         elif self.getIDof(username=newname) is not None:
             raise ValueError(f"The username '{newname}' is already used")
-        elif newname.lower() in self._restricted_usernames:
+        elif newname.lower() in self.RESTRICTED_NAMES:
             raise ValueError(f"The username '{newname}' is a restricted name")
 
         self.connectionInfo(f"User '{self.conns[clientid]['name']}' changed "
                             + f"name to '{newname}'")
         self.conns[clientid]['name'] = newname
-        self.sendCommandTo(self.mainDataSockof(clientid), 'changename',
+        self.sendCommandTo(self.mainDataSockOf(clientid), 'changename',
                            [newname])
         self.sendMsgTo(
             clientid, f"Your username changed to '\033[1m{newname}\033[0m'")
@@ -3735,7 +3876,7 @@ class Server:
 
             # Overall servercommand help
             elif args[0].lower() in ['command', 'commands', 'servercommands']:
-                sendtext = (
+                send_text = (
                     "\033[1;4mAVAILABLE SERVERCOMMANDS\033[0;1m:\033[0m"
                     + '\n  Use "s.help(*command_name*)" for more'
                     + "\n    information about that command"
@@ -3753,14 +3894,14 @@ class Server:
                 # Format commands
                 for group in sorted(groups):
                     if group != '':
-                        sendtext += f"\n  {group} commands:"
+                        send_text += f"\n  {group} commands:"
                     for name in groups[group]:
                         if group != '':
-                            sendtext += f"\n    {name}"
+                            send_text += f"\n    {name}"
                         else:
-                            sendtext += f"\n  {name}"
-                        sendtext += self._getFormattedCommandParams(name)
-                self.sendMsgTo(clientid, sendtext)
+                            send_text += f"\n  {name}"
+                        send_text += self._getFormattedCommandParams(name)
+                self.sendMsgTo(clientid, send_text)
 
             # Not literal *command_name*
             elif args[0] == '*command_name*':
@@ -3784,33 +3925,33 @@ class Server:
                     if command[1][7] == args[0]:
                         category_commands.append(command[0])
                 if len(category_commands) > 0:
-                    sendtext = f"Available '{args[0]}' commands:"
+                    send_text = f"Available '{args[0]}' commands:"
                     for command in sorted(category_commands):
-                        sendtext += f"\n  {command}"
-                        sendtext += self._getFormattedCommandParams(command)
+                        send_text += f"\n  {command}"
+                        send_text += self._getFormattedCommandParams(command)
                 else:
-                    sendtext = f"No '{args[0]}' command category"
-                self.sendMsgTo(clientid, sendtext)
+                    send_text = f"No '{args[0]}' command category"
+                self.sendMsgTo(clientid, send_text)
 
             # Specific servercommand help
             else:
-                infostr = "\033[1;4mSERVERCOMMAND INFO:\033[0m"
+                info_str = "\033[1;4mSERVERCOMMAND INFO:\033[0m"
                 for command in args:
                     command = command.split('(', 1)[0]
                     if not command.startswith('s.'):
                         command = 's.' + command
                     if command not in self.se_commands:
-                        infostr += f"\n  No servercommand '{command}'"
+                        info_str += f"\n  No servercommand '{command}'"
                     else:
-                        infostr += (
+                        info_str += (
                             f"\n  " + command
                             + self._getFormattedCommandParams(command))
-                        infostr += f"\n    {self.se_commands[command][6]}"
-                        infostr += (
+                        info_str += f"\n    {self.se_commands[command][6]}"
+                        info_str += (
                             f"\n    Needs '"
                             + ", ".join(self.se_commands[command][2])
                             + "' permissions")
-                self.sendMsgTo(clientid, infostr)
+                self.sendMsgTo(clientid, info_str)
 
         def info(clientid, args):
             # Info of servers
@@ -3834,7 +3975,7 @@ class Server:
 
         def ping(clientid):
             new_ping = self.pingSocket(
-                self.mainDataSockof(clientid))  # type: ignore
+                self.mainDataSockOf(clientid))  # type: ignore
             self.conns[clientid]['ping'] = new_ping
             if new_ping == -0.001:
                 self.sendMsgTo(clientid, f"Ping check could not be concluded")
@@ -3878,17 +4019,17 @@ class Server:
                 self.sendMsgTo(clientid, "Removed admin permissions")
             else:
                 for arg in args:
-                    removeid = self.getIDof(username=arg)
-                    if removeid is not None:
-                        if ('admin' in self.conns[removeid]['permissions']):
-                            self.conns[removeid]['permissions'].remove('admin')
+                    remove_id = self.getIDof(username=arg)
+                    if remove_id is not None:
+                        if ('admin' in self.conns[remove_id]['permissions']):
+                            self.conns[remove_id]['permissions'].remove('admin')
                             self.sendMsgTo(
                                 clientid, "Removed admin permissions of '"
-                                + self.conns[removeid]['name'] + "'")
-                            if clientid != removeid:
+                                + self.conns[remove_id]['name'] + "'")
+                            if clientid != remove_id:
                                 self.sendMsgTo(
-                                    removeid, "Your admin permissions got "
-                                    "removed by '"
+                                    remove_id, "Your admin permissions got "
+                                    "remo_ved by '"
                                     + self.conns[clientid]['name']
                                     + "'")
                         else:
@@ -3900,12 +4041,12 @@ class Server:
 
         def mute(clientid, args):
             for arg in args:
-                muteid = self.getIDof(username=arg)
-                if muteid is not None:
-                    if not self.conns[muteid]['muted']:
-                        self.conns[muteid]['muted'] = True
+                mute_id = self.getIDof(username=arg)
+                if mute_id is not None:
+                    if not self.conns[mute_id]['muted']:
+                        self.conns[mute_id]['muted'] = True
                         self.sendMsgTo(
-                            muteid, "You got muted by '"
+                            mute_id, "You got muted by '"
                             + self.conns[clientid]['name'] + "'")
                         self.sendMsgTo(clientid, f"Muted user '{arg}'")
                     else:
@@ -3916,12 +4057,12 @@ class Server:
 
         def unmute(clientid, args):
             for arg in args:
-                unmuteid = self.getIDof(username=arg)
-                if unmuteid is not None:
-                    if self.conns[unmuteid]['muted']:
-                        self.conns[unmuteid]['muted'] = False
+                unmute_id = self.getIDof(username=arg)
+                if unmute_id is not None:
+                    if self.conns[unmute_id]['muted']:
+                        self.conns[unmute_id]['muted'] = False
                         self.sendMsgTo(
-                            unmuteid, "You got unmuted by '"
+                            unmute_id, "You got unmuted by '"
                             + self.conns[clientid]['name'] + "'")
                         self.sendMsgTo(clientid, f"Unmuted user '{arg}'")
                     else:
@@ -3931,15 +4072,15 @@ class Server:
 
         def kickuser(clientid, args):
             for arg in args:
-                kickuserid = self.getIDof(username=arg)
-                if kickuserid is None:
+                kickuser_id = self.getIDof(username=arg)
+                if kickuser_id is None:
                     self.sendMsgTo(clientid, f"No user '{arg}'")
                     return
-                if kickuserid != clientid:
-                    self.sendMsgTo(kickuserid, "You got kicked by '"
+                if kickuser_id != clientid:
+                    self.sendMsgTo(kickuser_id, "You got kicked by '"
                                    + self.conns[clientid]['name'] + "'")
                     self.sendMsgTo(clientid, f"Kicked user '{arg}'")
-                self.disconnectConn(kickuserid)
+                self.disconnectConn(kickuser_id)
 
         def kickip(clientid, args):
             for arg in args:
@@ -3964,18 +4105,18 @@ class Server:
                     return
             # Connect to servername
             if len(args) == 1:
-                serverid = self.getIDof(username=args[0])
-                if serverid is None:
+                server_id = self.getIDof(username=args[0])
+                if server_id is None:
                     self.sendMsgTo(clientid, f"No Connection '{args[0]}'")
                     return
-                elif not self.conns[serverid]['isserver']:
+                elif not self.conns[server_id]['isserver']:
                     self.sendMsgTo(clientid, f"Connection '{args[0]}' "
                                        + "is no server")
                     return
                 self.sendCommandTo(
                     self.mainSocketof(clientid),
                     'connect',
-                    self.conns[serverid]['clientdata']['serveraddr'])
+                    self.conns[server_id]['clientdata']['serveraddr'])
                 # server side close if client refuses to disconnect. Since this
                 # Function is called through a recv thread this always works
                 self.mainSocketof(clientid).close()
@@ -4031,8 +4172,8 @@ class Server:
             cl_data = self.conns[clientid]['data']
             if 'restart_ack' in cl_data \
             and cl_data['restart_ack'] >= time() - 30:
-                for connid in self.conns:
-                    self.sendMsgTo(connid, f"Server '{self.username}' is "
+                for conn_id in self.conns:
+                    self.sendMsgTo(conn_id, f"Server '{self.username}' is "
                                        + "restarting")
                 self.restartServer()
                 return
@@ -4046,9 +4187,9 @@ class Server:
             cl_data = self.conns[clientid]['data']
             if 'shutdown_ack' in cl_data \
             and cl_data['shutdown_ack'] >= time() - 30:
-                for connid in self.conns:
+                for conn_id in self.conns:
                     self.sendMsgTo(
-                        connid,
+                        conn_id,
                         f"\033[1mServer '{self.username}' is shutting down"
                         + "\033[0m")
                 self.shutdownServer()
@@ -4073,34 +4214,34 @@ class Server:
                                 "*No problems*")
 
         def attributes(clientid):
-            sendtext = f"\033[1mAttributes of '{self.username}':\033[0m"
-            sendtext += "\n  Separator: " + self._se_sep
-            sendtext += "\n  Max datasize: " + str(self.se_max_datasize)
-            sendtext += "\n\n  Serverdata:"
+            send_text = f"\033[1mAttributes of '{self.username}':\033[0m"
+            send_text += "\n  Separator: " + self._se_sep
+            send_text += "\n  Max datasize: " + str(self.se_max_datasize)
+            send_text += "\n\n  Serverdata:"
             if len(self.getServerData()) > 0:
                 for key in self.getServerData():
-                    sendtext += f"\n    {key}"
+                    send_text += f"\n    {key}"
             else:
-                sendtext += "\n    *No Data*"
-            sendtext += "\n\n  ServerRequestables:"
+                send_text += "\n    *No Data*"
+            send_text += "\n\n  ServerRequestables:"
             if len(self.se_requestables) > 0:
                 for key in self.se_requestables:
-                    sendtext += f"\n    {key}"
+                    send_text += f"\n    {key}"
             else:
-                sendtext += "\n    *No Requestables*"
-            self.sendMsgTo(clientid, sendtext)
+                send_text += "\n    *No Requestables*"
+            self.sendMsgTo(clientid, send_text)
 
         def listthreads(clientid):
-            infostr = "\033[1mActive threads:\033[0m " + \
+            info_str = "\033[1mActive threads:\033[0m " + \
                 str(len(thread_enumerate()))
             thread_list = [th for th in thread_enumerate() if th.is_alive()]
             thread_list.sort(key=lambda thread_obj: thread_obj.name)
             for thread in thread_list:
-                infostr += ("\n  " + thread.name)
-            self.sendMsgTo(clientid, infostr)
+                info_str += ("\n  " + thread.name)
+            self.sendMsgTo(clientid, info_str)
 
         def listsocks(clientid):
-            sendtext = "\033[1mActive serversocks: (" + \
+            send_text = "\033[1mActive serversocks: (" + \
                 str(len(self.serversocks)) + ")\033[0m"
             for (name, entry) in self.serversocks.items():
                 port = entry[0].getsockname()[1]
@@ -4110,14 +4251,14 @@ class Server:
                     if port in conn['socks']:
                         n_connected += 1
                         connected_names.append(conn['name'])
-                sendtext += (
+                send_text += (
                     f"\n  {name} ({port})"
                     + f"\n    connected_users ({n_connected}):")
-                sendtext += "\n      " + ", ".join(connected_names)
-                sendtext += (
+                send_text += "\n      " + ", ".join(connected_names)
+                send_text += (
                     f"\n    connect_new_clients: {entry[1]}"
                     + f"\n    logging_info: {entry[2]}\n")
-            self.sendMsgTo(clientid, sendtext)
+            self.sendMsgTo(clientid, send_text)
 
         def getrights(clientid, args):
             added = []
@@ -4496,8 +4637,8 @@ class Server:
         --------
         >>> from datetime import now
         >>> def time_service(clientids):
-        ...     for connid in clientids:
-        ...         sendMsg(connid, now())
+        ...     for conn_id in clientids:
+        ...         sendMsg(conn_id, now())
         >>> s.newService('Time', time_service, as_thread=False)
         """
 
@@ -4551,18 +4692,18 @@ class Server:
             for clientid in clientids:
                 # Clientdata
                 self.conns[clientid]['clientdata'] = self.sendRequestTo(
-                    self.mainDataSockof(clientid),
+                    self.mainDataSockOf(clientid),
                     'CLIENTDATA')
                 # Serverdata
                 self.sendCommandTo(
-                    self.mainDataSockof(clientid),
+                    self.mainDataSockOf(clientid),
                     'updateserverdata',
                     [self.getServerData()])
 
         def ping_service(clientids):
             for clientid in clientids:
                 self.conns[clientid]['ping'] = self.pingSocket(
-                    self.mainDataSockof(clientid))
+                    self.mainDataSockOf(clientid))
 
         self.newService('Metadata_update', metadata_update_service)
         self.newService('Ping', ping_service)
@@ -4641,7 +4782,7 @@ class Server:
         >>> def ping_service():
         ...     for clientid in s.conns:
         ...         s.conns[clientid]['ping'] = s.pingSocket(
-        ...             s.mainDataSockof(clientid))
+        ...             s.mainDataSockOf(clientid))
         >>> s.newService('Ping', ping_service)
         >>> s.servicesController(routine_pause = 1)
         >>> # Pings clients every second
@@ -4756,7 +4897,7 @@ class Server:
         See Also
         --------
         mainSocketof : Gets a socket connected to the *serversock*
-        mainDataSockof : Gets a socket connected to the *maindatasock*
+        mainDataSockOf : Gets a socket connected to the *maindatasock*
         getIDof : Gets the ID of a client
 
         """
@@ -4800,13 +4941,13 @@ class Server:
         ---
         Examples
         --------
-        >>> s.mainDataSockof(getIDof(username='con1'))
+        >>> s.mainDataSockOf(getIDof(username='con1'))
         <socket ... >
         """
 
         return self.getSocketof(id, self.addr[1])
 
-    def mainDataSockof(self, id: str) -> socket:
+    def mainDataSockOf(self, id: str) -> socket:
         """Gets the client socket connected with the *maindatasock*.
 
         ...
@@ -4880,22 +5021,22 @@ class Server:
         if (username, socket, addr).count(None) < 2:
             self.warningInfo(
                 "Only one argument should be passed to get the ID of a client")
-        for connid in self.conns:
+        for conn_id in self.conns:
             if username is not None \
-            and self.conns[connid]['name'] == username:
-                return connid
+            and self.conns[conn_id]['name'] == username:
+                return conn_id
             elif socket is not None:
-                for port in self.conns[connid]['socks']:
-                    if self.conns[connid]['socks'][port] == socket:
-                        return connid
+                for port in self.conns[conn_id]['socks']:
+                    if self.conns[conn_id]['socks'][port] == socket:
+                        return conn_id
             elif addr is not None:
                 if isinstance(addr, tuple) \
-                and self.conns[connid]['addr'] == addr:
-                    return connid
+                and self.conns[conn_id]['addr'] == addr:
+                    return conn_id
                 else:  # Only ip given
-                    if self.conns[connid]['addr'][0] == addr \
+                    if self.conns[conn_id]['addr'][0] == addr \
                     and isinstance(addr, str):
-                        return connid
+                        return conn_id
         return None  # type: ignore
 
     def getMainDataPort(self) -> int:
@@ -5707,14 +5848,14 @@ class SubServer(Server, Client):
 
         def listnetwork():
             structure = ['', [], []]
-            for connid in self.conns:
-                if self.conns[connid]['isserver']:
+            for conn_id in self.conns:
+                if self.conns[conn_id]['isserver']:
                     structure[1].append(self.sendRequestTo(
-                        self.mainDataSockof(connid), 'LISTNETWORK', 2))
+                        self.mainDataSockOf(conn_id), 'LISTNETWORK', 2))
                 else:
                     structure[2].append('{}({})'.format(
-                        self.conns[connid]['name'],
-                        self.conns[connid]['addr'][0]))
+                        self.conns[conn_id]['name'],
+                        self.conns[conn_id]['addr'][0]))
             structure[0] = "{}({})  {} servers  {} clients".format(
                 self.username,
                 self.addr[0],
@@ -5753,8 +5894,8 @@ class SubServer(Server, Client):
         def setlayer(layer):
             port = self.getMainDataPort()
             self.layer = layer
-            for connid in self.conns:
-                self.sendCommandTo(self.conns[connid]['socks'][port],
+            for conn_id in self.conns:
+                self.sendCommandTo(self.conns[conn_id]['socks'][port],
                                    'setlayer', self.layer + 1)
 
         def shutdownNetwork():
@@ -5875,28 +6016,28 @@ class SubServer(Server, Client):
                         self.sendMsgTo(clientid, f"No user '{a}'")
 
         def attributes(clientid):
-            sendtext = f"\033[1mAttributes of '{self.username}':\033[0m"
-            sendtext += "\n  Separator: " + self._se_sep
-            sendtext += "\n  Max datasize: " + str(self.se_max_datasize)
-            sendtext += "\n\n  Serverdata:"
+            send_text = f"\033[1mAttributes of '{self.username}':\033[0m"
+            send_text += "\n  Separator: " + self._se_sep
+            send_text += "\n  Max datasize: " + str(self.se_max_datasize)
+            send_text += "\n\n  Serverdata:"
             if len(self.getServerData()) > 0:
                 for key in self.getServerData():
-                    sendtext += f"\n    {key}"
+                    send_text += f"\n    {key}"
             else:
-                sendtext += "\n    *No Data*"
-            sendtext += "\n\n  ServerRequestables:"
+                send_text += "\n    *No Data*"
+            send_text += "\n\n  ServerRequestables:"
             if len(self.se_requestables) > 0:
                 for key in self.se_requestables:
-                    sendtext += f"\n    {key}"
+                    send_text += f"\n    {key}"
             else:
-                sendtext += "\n    *No Requestables*"
-            sendtext += "\n\n  ClientRequestables:"
+                send_text += "\n    *No Requestables*"
+            send_text += "\n\n  ClientRequestables:"
             if len(self.cl_requestables) > 0:
                 for key in self.cl_requestables:
-                    sendtext += f"\n    {key}"
+                    send_text += f"\n    {key}"
             else:
-                sendtext += "\n    *No Requestables*"
-            self.sendMsgTo(clientid, sendtext)
+                send_text += "\n    *No Requestables*"
+            self.sendMsgTo(clientid, send_text)
 
         # User management
         self.newServerCommand(
@@ -6001,8 +6142,8 @@ class SubServer(Server, Client):
             return "Can't connect to own address"
         info = Client.connect(self, addr, autoconnect, timeout)
         if info == 'Connected':
-            for connid in self.conns:
-                self.sendCommandTo(self.mainDataSockof(connid), 'setlayer',
+            for conn_id in self.conns:
+                self.sendCommandTo(self.mainDataSockOf(conn_id), 'setlayer',
                                    [self.layer + 1])
         return info
 
@@ -6017,8 +6158,8 @@ class SubServer(Server, Client):
         """
 
         Client.recvServerMessage(self)
-        for connid in self.conns:
-            self.sendMsgTo(connid, "Lost connection with higher Server")
+        for conn_id in self.conns:
+            self.sendMsgTo(conn_id, "Lost connection with higher Server")
 
     def recvUserMessages(self, clientid: str, sock: socket):
         """Receives data from a clientsocket.
@@ -6190,14 +6331,14 @@ class MainServer(Server):
 
             # Collect network structure
             structure = ['', [], []]  # server, subserver, clients
-            for connid in self.conns:
-                if self.conns[connid]['isserver']:
+            for conn_id in self.conns:
+                if self.conns[conn_id]['isserver']:
                     structure[1].append(self.sendRequestTo(
-                        self.mainDataSockof(connid), 'LISTNETWORK', 2))
+                        self.mainDataSockOf(conn_id), 'LISTNETWORK', 2))
                 else:
                     structure[2].append("{}({})".format(
-                        self.conns[connid]['name'],
-                        self.conns[connid]['addr'][0]))
+                        self.conns[conn_id]['name'],
+                        self.conns[conn_id]['addr'][0]))
             structure[0] = "{}({})  {} servers  {} clients".format(
                 self.username,
                 self.addr[0],
@@ -6205,11 +6346,11 @@ class MainServer(Server):
                 len(structure[2]))
 
             # String format structure
-            infostr = "All connected instances in the network:\n"
-            infostr += "\n" + structure[0]
-            infostr += self.formatNetworklist(tuple(structure))
+            info_str = "All connected instances in the network:\n"
+            info_str += "\n" + structure[0]
+            info_str += self._formatNetworkList(tuple(structure))
 
-            self.sendMsgTo(clientid, infostr)
+            self.sendMsgTo(clientid, info_str)
 
         def restartserver(clientid, args):
             port = self.getSockData('Serversock')
@@ -6285,9 +6426,9 @@ class MainServer(Server):
             and cl_data['shutdown_net_ack'] >= time() - 30:
                 port = self.getSockData('Serversock')
                 port = port[0].getsockname()[1]
-                for connid in self.conns:
-                    self.sendMsgTo(connid, "Network is shutting down")
-                    conn = self.conns[connid]
+                for conn_id in self.conns:
+                    self.sendMsgTo(conn_id, "Network is shutting down")
+                    conn = self.conns[conn_id]
                     if conn['isserver']:
                         self.sendCommandTo(conn['socks'][port],
                                            'shutdownnetwork')
@@ -6347,7 +6488,7 @@ class MainServer(Server):
                            True, True)
         self.statusInfo("Mainserver operational")
 
-    def formatNetworklist(self, network: tuple[str, list[Any], list[str]],
+    def _formatNetworkList(self, network: tuple[str, list[Any], list[str]],
                           last: bool=True, prefix: str="") -> str:
         """Recursive string formatting for a list with connections.
 
@@ -6381,12 +6522,12 @@ class MainServer(Server):
         ---
         Examples
         --------
-        >>> ms.formatNetworklist(
+        >>> ms._formatNetworkList(
         ...    ['Mainserver(192.168.178.140)  0 servers  1 clients',
         ...     [], ['con(192.168.178.140)']])
         Mainserver(192.168.178.140)  0 servers  1 clients
         |----> con(192.168.178.140)
-        >>> ms.formatNetworklist(
+        >>> ms._formatNetworkList(
         ...    ['Mainserver(192.168.178.140)',
         ...     [['Testserver(192.168.178.140)',
         ...      [], ['unnamed_92951(192.168.178.140)']]],
@@ -6405,7 +6546,7 @@ class MainServer(Server):
             formatted += f"\n{prefix} |"
         for server in network[1]:
             formatted += f"\n{prefix} ├─ {server[0]}"
-            formatted += self.formatNetworklist(
+            formatted += self._formatNetworkList(
                 server,
                 server == network[1][-1],
                 f"{prefix} | ")
