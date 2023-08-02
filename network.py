@@ -61,22 +61,26 @@ It is assumed that the following instances are/get initialized:
 """
 
 
+from threading import Thread, Event, enumerate as thread_enumerate
 from pickle import PicklingError, UnpicklingError, dumps, loads
 from socket import socket, AF_INET, SOCK_DGRAM, SOCK_STREAM
+from logging import getLogger, FileHandler, Formatter
 from typing import Optional, Callable, Iterable, Any
 from contextlib import suppress
-from threading import enumerate as thread_enumerate
-from threading import Thread
-from itertools import count
 from datetime import datetime
 from time import time, sleep
+from itertools import count
 from uuid import uuid4
-from re import compile
-from os import system
+
+from rich.progress import Progress, SpinnerColumn
+from rich.logging import RichHandler
+from rich.console import Console
+from rich.panel import Panel
+from rich import print
 
 
 __version__ = '1.1.0'
-__date__ = '2023/07/04'
+__date__ = '2023/08/02'
 __author__ = 'Laurenz Nitsche'
 
 
@@ -128,12 +132,12 @@ class Client:
         Depth layer in the network
     logfile : str
         Filename that saves occurred events
+    rich_console : rich.Console
+        Console for outputs
     starttime : float
         Time the client was initialized
     username : str
         Username of the client
-    _ansi : bool
-        Allow ANSI text formatting
     _cl_sep: str
         Separator identifies end of transmitted package
     _connecting : bool
@@ -142,8 +146,6 @@ class Client:
         Time the client established a connection to a server
     _conntype : str
         Application type of the client
-    _log : list[str]
-        All occurred events
     _open_requests : dict
         Unanswered data requests
         dict[id:str, request_or_data:object]
@@ -181,10 +183,10 @@ class Client:
     >>> c.disconnect()
     """
 
-    __version__ = '6.27.136'
+    __version__ = '6.27.141'
 
     def __init__(self, username: str = '', description: str = "None",
-                 logfile: str = '', ansi: bool = True):
+                 logfile: str = ''):
         """...
 
         Parameters
@@ -195,14 +197,14 @@ class Client:
             Information text about the client
         logfile : str, optional
             Path to file that stores all occurred events
-        ansi : bool, optional
-            Allow *ANSI* text formatting codes
 
         ---
         Notes
         -----
         - The **description** should state the abilities or purpose of
         the client.
+        - The default logging level is *info*. If a **logfile** is set
+        the logging level is *debug*.
 
         ---
         Examples
@@ -213,7 +215,6 @@ class Client:
         self.username = username
         self.description = description
         self.logfile = logfile
-        self._ansi = ansi
 
         self.clientsocks: dict[int, socket] = {}
         self.cl_commands: dict[str, tuple[Callable, bool]] = {}
@@ -221,7 +222,6 @@ class Client:
         self.cl_serverdata: dict[str, Any] = {}
         self.autoconnect_addrs: list[tuple[str, int]] = []
         self._open_requests: dict[str, object] = {}
-        self._log: list[str] = []
         self._starttime: float = time()
         self._connecttime: float = 0.0
         self._connecting: bool = False
@@ -234,22 +234,39 @@ class Client:
         self._cl_sep: str = ''
         self.layer: int = 0
 
+        # Setup console formatting and logging
+        self.logger = getLogger(__name__)
+        self.rich_console = Console()
+        if not self.logger.handlers:
+            handler = RichHandler(console=self.rich_console, show_time=True,
+                                show_level=True, markup=True,
+                                rich_tracebacks=True)
+            handler.setFormatter(Formatter("%(message)s", datefmt="[%X]"))
+            self.logger.addHandler(handler)
+            logging_level = "INFO"
+            if logfile != '':
+                logging_level = "DEBUG"
+                file_handler = FileHandler(logfile, mode="w")
+                file_handler.setLevel(logging_level)
+                file_handler.setFormatter(
+                    Formatter("[%(asctime)s] %(levelname)-8s %(message)-64s "
+                              + "<%(funcName)s:%(lineno)d>",
+                            "%Y-%m-%d %H:%M:%S"))
+                self.logger.addHandler(file_handler)
+            self.logger.setLevel(logging_level)
+            handler.setLevel(logging_level)
+
         # Getting the ip with `gethostname()` doesn't work for raspberry
         s = socket(AF_INET, SOCK_DGRAM)
         s.connect(('1.1.1.1', 1))
         self.ip: str = s.getsockname()[0]
         s.close()
 
-        # Display ANSI formatting on windows
-        if self._ansi: system("")
-
         Client._initClientcommands(self)
         Client._initClientRequestables(self)
 
-        if self.logfile != '':
-            self.logEvent(f"Storing log '{self.logfile}'")
-            open(self.logfile, 'w').close()
-        self.logEvent(f"Client ({Client.__version__}|{self._conntype}) loaded")
+        self.logger.debug(
+            f"Client ({Client.__version__}|{self._conntype}) loaded")
 
     def newClientCommand(self, name: str, action: Callable,
                          call_as_thread: bool = False,
@@ -316,8 +333,9 @@ class Client:
         if name in self.cl_commands and not overwrite:
             raise NameError(f"Clientcommand '{name}' already exists")
         if name not in self.cl_commands and overwrite:
-            self.warningInfo(
-                f"Creating new clientcommand since no '{name}' exists")
+            self.logger.debug(f"Creating new clientcommand since no '{name}' exists")
+            # self.log_warning(
+            #     f"Creating new clientcommand since no '{name}' exists")
         self.cl_commands[name] = (action, call_as_thread)
 
     def delClientCommand(self, name: str):
@@ -402,7 +420,7 @@ class Client:
             raise NameError(
                 f"Requestable data through '{name}' already exists")
         if name not in self.cl_requestables and overwrite:
-            self.warningInfo(
+            self.log_warning(
                 f"Creating new requestable since no key '{name}' exists")
         self.cl_requestables[name] = data
 
@@ -467,7 +485,7 @@ class Client:
         """
 
         if command not in self.cl_commands:
-            self.warningInfo(f"Unknown clientcommand '{command}'")
+            self.log_warning(f"Unknown clientcommand '{command}'")
         elif self.cl_commands[command][1]:
             if self.cl_commands[command][0].__code__.co_varnames[0] == \
             'calling_socket':
@@ -490,7 +508,7 @@ class Client:
                 else:
                     self.cl_commands[command][0](*args)
             except Exception as e:
-                self.errorInfo("Error while executing clientcommand "
+                self.log_error("Error while executing clientcommand "
                                 + f"'{command}': {str(e)}")
 
     def _initClientcommands(self):
@@ -530,7 +548,7 @@ class Client:
         def connect(ip, port):
             Thread(
                 target=self.connect,
-                args=((ip, int(port)), False,),
+                kwargs={'addr': (ip, int(port)), 'autoconnect': False},
                 name='connect'
             ).start()
 
@@ -569,11 +587,10 @@ class Client:
     # Connect and communication methods |
     # ----------------------------------+
 
-    def searchServer(self, ports: int | Iterable[int] = range(4000, 4010),
+    def searchServer(self, ports: int | Iterable[int] = range(4000, 4005),
                      ips: str  | Iterable[str] = 'locals',
                      only_one: bool = False, add_to_autoconnect: bool = True,
-                     timeout: float = 0.1, log_info: bool = False
-                     ) -> list[tuple[str, int]]:
+                     timeout: float = 0.025) -> list[tuple[str, int]]:
         """Searches for active servers in the same network.
 
         ...
@@ -598,8 +615,6 @@ class Client:
             Automatically save addresses for *autoconnect* attempts
         timeout: float, optional
             Timeout for the search
-        log_info : bool, optional
-            Log information about tried addresses and found server
 
         ---
         Returns
@@ -643,25 +658,33 @@ class Client:
             ips = [ips]
 
         # Thread that searches for servers on a certain port
-        def searchPortOnAddress(for_ips, on_port):
-            def mute(client, message): pass
-            c = Client()
+        def searchPortOnAddress(self, for_ips, on_port):
+            class ServerFinder(Client):
+                def __init__(self, *args, **kwargs):
+                    super().__init__()
+            c = ServerFinder()
             c._conntype = 'SERVERFINDER'
-            c.printInfo = mute.__get__(c, Client)
-            c.statusInfo = mute.__get__(c, Client)
-            c.warningInfo = mute.__get__(c, Client)
-            c.errorInfo = mute.__get__(c, Client)
+            c.logger = getLogger("dummy")
+            def mute(client, arg1, arg2=None, arg3=None): pass
+            c.text_output = mute.__get__(c, Client)
+            c.log_info = mute.__get__(c, Client)
+            c.log_warning = mute.__get__(c, Client)
+            c.log_error = mute.__get__(c, Client)
+            c.panel_output = mute.__get__(c, Client)
+            c.logger.debug = mute.__get__(c, Client)
+
             for ip in for_ips:
                 if only_one and len(found_servers) > 0:
-                    return
+                    break
                 info = c.connect((ip, on_port), autoconnect=False,
-                                 timeout=timeout)
+                                timeout=timeout)
                 if only_one and len(found_servers) > 0:
-                    return
+                    break
                 if info == 1:
                     found_servers.append((ip, on_port))
-                    if log_info:
-                        self.statusInfo(f"Found Server on {ip} at {on_port}")
+                    self.logger.debug(f"Found Server on {ip} at {on_port}")
+            del c
+
 
         found_servers = []
         threads = []
@@ -672,25 +695,33 @@ class Client:
         if ips == ['locals']:
             ip_base = self.ip[::-1].split('.', 1)[1][::-1]
             ips = [f'{ip_base}.{e}' for e in range(256)]
-        if log_info:
-            self.statusInfo(
-                "Searching for " + ("a server" if only_one else "servers")
-                + f" on {len(ips)} {'IPs' if len(ips) > 1 else 'IP'}"
-                + f" at {len(ports)} "
-                + f"{'ports' if len(ports) > 1 else 'port'}.")
+        self.log_info(
+            "Searching for " + ("a server" if only_one else "servers")
+            + f" on {len(ips)} {'IPs' if len(ips) > 1 else 'IP'}"
+            + f" at {len(ports)} "  # type: ignore
+            + f"{'ports' if len(ports) > 1 else 'port'}.")  # type: ignore
 
         for port in ports:
             threads.append(Thread(target=searchPortOnAddress,
-                                            args=(ips, port,),
+                                            args=(self, ips, port,),
                                             name=f'Search_{port}'))
             threads[-1].start()
 
-        for thread in threads:
-            thread.join()
+        # Wait until searches are finished
+        progress = Progress(SpinnerColumn(style="bold cyan"),
+                            "[cyan][italic]Searching server...",
+                            console=self.rich_console)
+        with progress:
+            task = progress.add_task("Searching")
+            for thread in threads:
+                thread.join()
+                progress.update(task, advance=1)
+            progress.remove_task(task)
         if add_to_autoconnect:
             for addr in found_servers:
                 if addr not in self.autoconnect_addrs:
                     self.autoconnect_addrs.append(addr)
+        self.log_info(f"Server search found {len(found_servers)} server")
         return found_servers
 
     def disconnect(self):
@@ -711,6 +742,7 @@ class Client:
 
         servername = self.cl_serverdata['servername'] if 'servername' in \
                 self.cl_serverdata else ''
+        was_connected = self.connected
         self.connected = False
         self._connecting = False
         self.connected_addr = ('', -1)
@@ -720,24 +752,28 @@ class Client:
         self.layer = 0
 
         started = time()
-        # Disconnect all socket (through this loop or receiving threads)
+        # Disconnect all socket
+        # NOTE: Receiving threads can also remove the socket
         while len(self.clientsocks) > 0:
-            # NOTE: The socket can als be removed by a receiving thread
-            # in this case no action is required.
             with suppress(ValueError, KeyError):
                 sock = self.clientsocks[list(self.clientsocks.keys())[0]]
                 del self.clientsocks[self.getPort(sock)]
                 sock.close()
             if time() - started > 1.5:
-                self.errorInfo("Failed to correctly disconnect the client")
+                self.log_error("Failed to correctly disconnect the client")
                 return
         if self._conntype != 'SERVERFINDER':
-            if servername != '':
-                self.statusInfo(f"Disconnected from Server '{servername}'")
+            if was_connected:
+                if servername != '':
+                    self.log_info(
+                        f"[cyan]Disconnected from Server '{servername}'")
+                else:
+                    self.log_info("[cyan]Disconnected from Server")
+                self.panel_output("[cyan][bold]Disconnect", "Connect", "cyan")
             else:
-                self.statusInfo("Disconnected from Server")
+                self.logger.debug("Reset connection variables")
 
-    def _setup_connect(func: callable):
+    def _setup_connect(func: callable):  # type: ignore
         """Decorator that sets up things before connecting to a server.
 
         ...
@@ -751,9 +787,10 @@ class Client:
         Returns
         -------
         int : Status result of the connect attempt:
+            `-3` : Setup not valid
             `-2` : No server on address(es)
             `-1` : Timeout
-             `0` : Already connecting / No address(es) to connect to
+             `0` : Already connecting
              `1` : Registration failed / Can't interact with server
              `2` : Success / connected
 
@@ -764,8 +801,9 @@ class Client:
         autoConnect : Tries to connect to any of the already known addrs
         """
 
-        def inner(self, addr: tuple[str, int] = (), timeout: float=0.5,
-                  await_maindatasock: bool = True,
+        def inner(self, addr: tuple[str, int] = (),  # type: ignore
+                  timeout: float=0.5,
+                  await_maindatasock: bool=True,
                   *args, **kwargs) -> int:
             kwargs['timeout'] = timeout
             kwargs['addr'] = addr
@@ -773,57 +811,78 @@ class Client:
             # Preparation
             if not addr:
                 addr = ('', -1)
-                # Preparation
             if not addr:
                 addr = ('', -1)
             if self._connecting:
-                self.statusInfo("Already connecting")
+                self.log_info("A connect attempt is already in progress")
                 return 0
             if self.connected:
                 self.disconnect()
+            self.log_info("Connecting")
             self._connecting = True
 
-            # Connect attempt by function call
-            sock = func(self, *args, **kwargs)
-            if isinstance(sock, int):
+            status = self.rich_console.status(
+                "[cyan]Establishing connection")
+            # Create a dummy status for serverfinder (prevents flickering)
+            if self._conntype == 'SERVERFINDER':
+                class StatusDummy:
+                    def __enter__(self): return self
+                    def __exit__(self, exc_type, exc_val, exc_tb): pass
+                    def update(self, text): pass
+                status = StatusDummy()
+
+            with status:
+                # Connect attempt by function call
+                sock = func(self, *args, **kwargs)
+                if isinstance(sock, int):
+                    self._connecting = False
+                    status.update("[red]Failed")
+                    self.panel_output(f"[red][bold] Error code: {sock}",
+                                      "Connect", "red")
+                    return sock  # Return failure status of connect function
+
+                # Registration
+                status.update("[green]Registering")
+                f = self._registration(sock)
+                if not f:
+                    self.disconnect()
+                    self.log_info("Registration failed")
+                    self.panel_output("[red][bold]Registration failed",
+                                      "Connect", "red")
+                    return 1
+                status.update("[green]Registered")
+
+                # Connected
+                self.connected = True
                 self._connecting = False
-                return sock  # Return failure status of connect function
+                self._connecttime = time()
+                self.connected_addr = sock.getpeername()
+                self.clientsocks[self.connected_addr[1]] = sock
+                status.update("[green]Connected")
+                self.log_info(f"Connected with {self.connected_addr}")
+                self.panel_output("[green][bold]Connected with " +
+                                  f"{self.connected_addr}", "Connect", "green")
+                Thread(target=self.recvServerMessage,
+                       name='Recv_Server').start()
+                sock.send('continue'.encode())  # Ends server side registration
 
-            # Registration
-            f = self._registration(sock)
-            if not f:
-                self.disconnect()
-                self.statusInfo("Registration failed")
-                return 1
+                # Add addr to autoconnect
+                if not [entry for entry in self.autoconnect_addrs \
+                        if entry is self.connected_addr]:
+                    self.autoconnect_addrs.append((
+                        self.connected_addr[0],
+                        self.connected_addr[1]))
 
-            # Connected
-            self.connected = True
-            self._connecting = False
-            self._connecttime = time()
-            self.clientsocks[addr[1]] = sock
-            self.connected_addr = sock.getpeername()
-            Thread(target=self.recvServerMessage, name='Recv_Server').start()
-            self.statusInfo(f"Connected with {self.connected_addr}")
-            sock.send('continue'.encode())  # Ends server side registration
-
-            # Add addr to autoconnect
-            if not [entry for entry in self.autoconnect_addrs \
-                    if entry is self.connected_addr]:
-                self.autoconnect_addrs.append((
-                    self.connected_addr[0],
-                    self.connected_addr[1]))
-
-            # Await maindatasock (if available)
-            socknames = [sock[0] for sock in self.cl_serverdata['socks']]
-            if await_maindatasock and 'Maindata' in socknames:
-                starttime = time()
-                while len(self.clientsocks) == 1:
-                    if time() - starttime > timeout:
-                        self.warningInfo(
-                            "Maindatasock dit not get connected in time")
-                        break
-            self.statusInfo("Connected and registered")
-            return 2  # Success
+                # Await maindatasock (if available)
+                socknames = [sock[0] for sock in self.cl_serverdata['socks']]
+                if await_maindatasock and 'Maindata' in socknames:
+                    starttime = time()
+                    while len(self.clientsocks) == 1:
+                        if time() - starttime > timeout:
+                            self.log_warning(
+                                "Maindatasock dit not get connected in time")
+                            break
+                return 2  # Success
         return inner
 
     @_setup_connect
@@ -855,12 +914,7 @@ class Client:
         Returns
         -------
         socket : Connected socket if successful
-        int : Status result of the connect attempt:
-            `-2` : No server on address(es)
-            `-1` : Timeout
-             `0` : Already connecting / No address(es) to connect to
-             `1` : Registration failed
-             `2` : Success, connected
+        int : Status result like for `Client._setup_connect`
 
         ---
         See Also
@@ -872,6 +926,7 @@ class Client:
         ---
         Notes
         -----
+        - Arguments should always be passed as key word arguments.
         - Addresses of known servers for *autoconnect* can be gained
         with `searchForServer()` and are stored in `autoconnect_addrs`.
         - Direct connect can not lead to a timeout error.
@@ -890,30 +945,30 @@ class Client:
         if not addr:
             addr = ('', -1)
         if addr == ('', -1) and not autoconnect:
-            self.stausInfo("No address provided and autoconnect disabled")
-            return 0
+            self.log_info("No address provided and autoconnect disabled")
+            return -3
 
         # Direct connect
         sock = socket()
         sock.settimeout(timeout)
         try:
-            if addr != ('', -1):
-                self.statusInfo(f"Connecting to {addr}")
-                sock.connect((addr[0], int(addr[1])))
-                sock.settimeout(None)
-                # Socket is connected (otherwise exception is raised)
-                sock.getpeername()
-                return sock
+            if addr == ('', -1):
+                raise OSError  # No address provided, try autoconnect
+            self.logger.debug(f"Direct connect to {addr}")
+            sock.connect((addr[0], int(addr[1])))
+            sock.settimeout(None)
+            sock.getpeername()  # Raises exception if not connected
+            return sock
         except (OSError, TimeoutError) as error:
+            if not addr == ('', -1): self.logger.debug("Server not reachable")
             if autoconnect:
-                self._connecting = False  # Needed bc autoconnect has decorator
-                return self.autoConnect(timeout=timeout)
+                return self._auto_connect(timeout=timeout)
             if error == TimeoutError:
-                self.stuatusInfo(
+                self.log_info(
                     f"Timeout {timeout} while connecting to {addr}")
                 return -1
             else:
-                self.statusInfo("No server found")
+                self.log_info("No server found")
                 return -2
 
     @_setup_connect
@@ -950,7 +1005,7 @@ class Client:
         --------
         connect : Connect the client to a server
         _setup_connect : Decorator to set up things for connecting
-        _checkAddr : Checks if a server is available at an address
+        _parallel_connect_attempt : Thread function for parallel connect
 
         ---
         Notes
@@ -966,38 +1021,44 @@ class Client:
         >>> c.autoConnect(timeout=1.5)
         """
 
+        return self._auto_connect(timeout, *args, **kwargs)
+
+    def _auto_connect(self, timeout, *args, **kwargs) -> int | socket:
+        """Backend autoconnect. Use `Client.autoConnect()` instead.
+        """
+
         if len(self.autoconnect_addrs) == 0:
-            self.statusInfo("No IPs for autoconnect")
+            self.log_info("No IPs for autoconnect")
             return 0
 
-        self.statusInfo("Starting autoconnect")
+        self._autoconnect_connect_event = Event()
+        self._autoconnect_shared_var = True
+        self.logger.debug("Starting autoconnect threads")
         for addr in self.autoconnect_addrs:
             Thread(
-                target=self._checkAddr,
+                target=self._parallel_connect_attempt,
                 args=(addr,),
-                name=f'checkAddr_{addr[0]}'
+                name=f'par_connect_{addr[0]}'
             ).start()
 
         # Wait for connection (or timeout)
-        started = time()
-        while not self.connected:
-            if time() - started >= timeout:
-                if len(self.clientsocks) == 1:
-                    del self.clientsocks[addr[1]]
-                self.statusInfo(
-                    f"Timeout ({timeout} secs) while waiting for a connection")
-                return -1
-            sleep(0.0001)
-        return self.clientsocks[addr[1]]
+        if not self._autoconnect_connect_event.wait(timeout):
+            self.log_info(
+                f"Timeout ({timeout} secs) while waiting for a connection")
+            return -1
+        connected_sock = self._autoconnect_shared_var
+        del self._autoconnect_connect_event
+        del self._autoconnect_shared_var
+        return connected_sock
 
-    def _checkAddr(self, addr: tuple[str, int], timeout=0.25):
-        """Tries to connect a `socket` to an address.
+    def _parallel_connect_attempt(self, addr: tuple[str, int], timeout=0.5):
+        """Thread function for parallel connect attempts.
 
         ...
 
-       Simply connects a `socket` object to an address and handles
-       connect success and failure. Used to speed up an *autoconnect* of
-       `connect()`.
+        Multiples threads of this function attempt to connect to
+        different addresses in parallel. The first successful connection
+        is used, all others are discarded.
 
         ---
         Parameters
@@ -1010,30 +1071,32 @@ class Client:
         ---
         See Also
         --------
-        connect : Connects the client to a server
+        connect : Connects the client to a specific server
+        autoConnect : Connects to an already known server
 
         ---
         Notes
         -----
-        - This is not an equivalent to the `connect()`. method.
-        - The *autoconnect* option of `connect()` tries to connect to an
-        already known server address without entering the address again.
+        - This is normally used by `autoConnect()`.
+        - A global shared value **self._autoconnect_shared_var** is used
+        to give the connected socket back and abort all other parallel
+        connecting threads. This variable is managed by `autoConnect()`.
         """
 
         checksock = socket()
         try:
-            if not self.connected and self._connecting:
-                self.statusInfo(f"Connecting to {addr}")
+            if not self._autoconnect_connect_event.is_set() \
+            and self._connecting:
                 checksock.settimeout(timeout)
                 checksock.connect((addr[0], int(addr[1])))
-                if not self.connected and self._connecting:
-                    self.connected_addr = addr
-                    self.connected = True
-                    self.clientsocks[addr[1]] = checksock
-                    self.clientsocks[addr[1]].settimeout(None)
+                if not self._autoconnect_connect_event.is_set():
+                    self._autoconnect_shared_var = checksock
+                    self._autoconnect_shared_var.settimeout(None)
+                    self._autoconnect_connect_event.set()
             else:
                 checksock.close()
-        except OSError:
+        except (OSError, AttributeError):
+            checksock.close()
             del checksock
 
     def _registration(self, sock: socket) -> bool:
@@ -1102,7 +1165,7 @@ class Client:
             # Exchange clientdata
             binary_clientdata = dumps(self.getClientData())
             if len(binary_clientdata) > 4096:
-                self.errorInfo(
+                self.log_error(
                     "Clientdata is larger than 4096 bytes")
                 raise ConnectionError
             sock.send(binary_clientdata)
@@ -1113,10 +1176,10 @@ class Client:
             return True
 
         except (ConnectionError, ConnectionResetError, EOFError):
-            self.statusInfo("Registration failed")
+            self.log_info("Registration failed")
             return False
         except TimeoutError:
-            self.statusInfo(f"Can't interact with server at '{addr}'")
+            self.log_info(f"Can't interact with server at '{addr}'")
             return False
 
     def connectDatasock(self, addr: tuple[str, int],
@@ -1166,11 +1229,11 @@ class Client:
         """
 
         if not self.connected:
-            self.warningInfo(
+            self.log_warning(
                 "Client needs to be connected to create a datasocket")
             return None
         if addr[1] in self.clientsocks.keys():
-            self.warningInfo(f"A socket is already connected to {addr}")
+            self.log_warning(f"A socket is already connected to {addr}")
             return None
         if recv_func == 'default':
             recv_func = self.recvServerData
@@ -1189,7 +1252,7 @@ class Client:
             new_datasock.send(dumps(
                 self.clientsocks[self.connected_addr[1]].getsockname()))
         except (TimeoutError, ConnectionResetError):
-            self.statusInfo(
+            self.log_info(
                 f"Address {addr} is unsuited for a datasocket")
             new_datasock.close()
             return None
@@ -1200,7 +1263,7 @@ class Client:
             name=f'Recv_Data{new_datasock.getpeername()[1]}'
         ).start()
         self.clientsocks[addr[1]] = new_datasock
-        self.statusInfo(f"Connected new datasocket to port {addr[1]}")
+        self.log_info(f"Connected new datasocket to port {addr[1]}")
         return new_datasock
 
     def recvServerMessage(self):
@@ -1263,10 +1326,10 @@ class Client:
             while self.connected:
                 buffer += sock.recv(self.cl_max_datasize)
                 if len(buffer) > self.cl_max_datasize * 16:
-                    self.warningInfo(f"Receiving buffer for socket {port} "
+                    self.log_warning(f"Receiving buffer for socket {port} "
                                      + "holds a lot of bytes")
                 if len(data_packets) > 16:
-                    self.warningInfo(f"Socket on {port} has many uncompleted "
+                    self.log_warning(f"Socket on {port} has many uncompleted "
                                      + "transmissions packets")
 
                 # Extract packets in buffer
@@ -1275,7 +1338,7 @@ class Client:
                     try:
                         packet = loads(packet)
                     except UnpicklingError:
-                        self.warningInfo(f"A received packet on port '{port}' "
+                        self.log_warning(f"A received packet on port '{port}' "
                                          + "cannot be decoded")
                         continue
 
@@ -1297,7 +1360,7 @@ class Client:
                     try:
                         data = loads(packet[3])
                     except UnpicklingError:
-                        self.warningInfo(f"Received data on port '{port}' is "
+                        self.log_warning(f"Received data on port '{port}' is "
                                          + "unreadable and will be ignored")
                         continue
 
@@ -1317,10 +1380,10 @@ class Client:
                             if data[2] in self._open_requests:
                                 self._open_requests[data[2]] = data[3]
                             else:
-                                self.warningInfo(
+                                self.log_warning(
                                     "Received requested data after timeout")
                         else:
-                            self.errorInfo(
+                            self.log_error(
                                 f"Invalid request phrase '{data[1]}'")
 
                     # Process clientcommand
@@ -1331,27 +1394,21 @@ class Client:
                     elif isinstance(data, str):
                         if self.getPort(sock) == self.connected_addr[1]:
                             sender = (
-                                f"\033[0;1m[\033[4;53m"
-                                + f"{datetime.now().strftime('%H:%M:%S')}"
-                                + "\033[0m]\033[3m"
-                                + f"{self.cl_serverdata['servername']}"
-                                + "\033[0m> ")
+                                f"[{datetime.now().strftime('%H:%M:%S')}]"
+                                + f"{self.cl_serverdata['servername']}> ")
                         else:
                             sender = (
-                                f"\033[0;1m[\033[4;53m"
-                                + f"{datetime.now().strftime('%H:%M:%S')}"
-                                + f"\033[0m]\033[3m"
+                                f"[{datetime.now().strftime('%H:%M:%S')}]"
                                 + f"{self.cl_serverdata['servername']}"
-                                + f"\033[2m({sock.getpeername()[1]})"
-                                + "\033[0m> ")
-                        self.printInfo(data, sender)
+                                + f"({sock.getpeername()[1]})> ")
+                        self.text_output(data, sender)
                     else:
-                        self.warningInfo("Received unprocessable data at a"
+                        self.log_warning("Received unprocessable data at a"
                                          + f"datasock connected at port"
                                          + str(sock.getpeername()[1]))
             raise ConnectionResetError
         except (ConnectionResetError, ConnectionAbortedError, OSError):
-            self.statusInfo(f"Lost connection to socket at {port}")
+            self.log_info(f"Lost connection to socket at port {port}")
         finally:
             sock.close()
             try:
@@ -1406,13 +1463,13 @@ class Client:
         """
 
         if not self.connected:
-            self.warningInfo("No connection to send data to")
+            self.log_warning("No connection to send data to")
             return
         transmission_id = self._generateTransmissionID()
         try:
             data = dumps(data)
         except PicklingError:
-            self.errorInfo("Transmitting data cannot be converted to bytes")
+            self.log_error("Transmitting data cannot be converted to bytes")
             return
         # Data can't contain the original separator to be usable
         data = data.replace(self._cl_sep.encode(),
@@ -1432,9 +1489,8 @@ class Client:
                           data[pack*data_per_packet:(pack+1)*data_per_packet]])
                     + self._cl_sep.encode())
         except Exception as e:
-            self.warningInfo(
+            self.log_warning(
                 f"Senderror: {str(e)[:35]}... by passing {str(e)[:30]}....")
-            self.logEvent(f"occurred error: {e}")
 
     def sendMsg(self, message: str):
         """Sends a string to a server.
@@ -1534,7 +1590,7 @@ class Client:
         while self.connected and self._open_requests[key] == request:
             if timeout is not None \
             and time() - starttime >= timeout:
-                self.warningInfo(
+                self.log_warning(
                     f"Request for '{request}' did not receive data")
                 return None
         data = self._open_requests[key]
@@ -1586,6 +1642,7 @@ class Client:
         return {'description': self.description,
                 'username': self.username,
                 'client_version': Client.__version__,
+                'conntype': type(self).__name__,
                 'commands': list(self.cl_commands.keys()),
                 'requestables': list(self.cl_requestables.keys())}
 
@@ -1639,7 +1696,7 @@ class Client:
     # Displaying functions |
     # ---------------------+
 
-    def printInfo(self, message: str, sender: str = ""):
+    def text_output(self, message: str, sender: str = ""):
         """Outputs a server message and logs the event.
 
         ...
@@ -1657,26 +1714,22 @@ class Client:
         ---
         See Also
         --------
-        statusInfo : Outputs a state of the client
-        warningInfo : Outputs a warning
-        errorInfo : Outputs an error
-        logEvent : Logs an events
+        log_info : Outputs a state of the client
+        log_warning : Outputs a warning
+        log_error : Outputs an error
 
         ---
         Notes
         -----
-        - The message can be colored if *ANSI* codes are allowed.
+        - The message can be formatted with *ansi* codes.
         """
 
         if not sender:
-            message = f"\033[1;4m{sender}\033[0;1m\033[0m{message}"
-        if not self._ansi:
-            message = compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])').sub(
-                '', message)
-        print(message)
-        self.logEvent(message)
+            print(f"{sender}: {message}")
+        else:
+            print(message)
 
-    def statusInfo(self, status: str):
+    def log_info(self, info: str):
         """Outputs a state of the client and logs the event.
 
         ...
@@ -1689,26 +1742,14 @@ class Client:
         ---
         See Also
         --------
-        printInfo : Outputs a server message
-        warningInfo : Outputs a warning
-        errorInfo : Outputs an error
-        logEvent : Logs an event
-
-        ---
-        Notes
-        -----
-        - If *ANSI* codes are allowed the status will be displayed gray.
+        text_output : Outputs a server message
+        log_warning : Outputs a warning
+        log_error : Outputs an error
         """
 
-        if self._ansi:
-            print(f"\033[38;5;243m{status}\033[0m")
-        else:
-            status = compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])').sub(
-                '', status)
-            print(status)
-        self.logEvent(f"STATUS: {status}")
+        self.logger.info(info)
 
-    def warningInfo(self, warning: str):
+    def log_warning(self, warning: str):
         """Outputs a warning and logs the event.
 
         ...
@@ -1721,28 +1762,14 @@ class Client:
         ---
         See Also
         --------
-        printInfo : Outputs a server message
-        statusInfo : Outputs a state of the client
-        errorInfo : Outputs an error
-        logEvent : Logs an event
-
-        ---
-        Notes
-        -----
-        - If *ANSI* formatting is allowed, the warning will be displayed
-        orange.
+        text_output : Outputs a server message
+        log_info : Outputs a state of the client
+        log_error : Outputs an error
         """
 
-        if self._ansi:
-            print("\033[38;5;214m\033[1;4mWAR:\033[0;1m\033[38;5;214m " + \
-                  warning + "\033[0m")
-        else:
-            warning = compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])').sub(
-                '', warning)
-            print(f"WAR: {warning}")
-        self.logEvent(f"WARNING: {warning}")
+        self.logger.warning(warning)
 
-    def errorInfo(self, error: str):
+    def log_error(self, error: str):
         """Outputs an error and logs the event.
 
         ...
@@ -1756,64 +1783,41 @@ class Client:
         ---
         See Also
         --------
-        printInfo : Outputs a server message
-        statusInfo : Outputs a state of the client
-        warningInfo : Outputs a warning
-        logEvent : Logs an events
+        text_output : Outputs a server message
+        log_info : Outputs a state of the client
+        log_warning : Outputs a warning
+        """
+
+        self.logger.error(error)
+
+    def panel_output(self, text: str, header: str="",
+                     border_style: str="white"):
+        """Highlights important information with a border
+        ...
+
+        Uses `rich.Panel` to surround the text with a border. This can
+        be used to highlight important statements. Note that this action
+        will not be logged.
+
+        ---
+        Parameter
+        ---------
+        text : str
+            Information to display
+        header : str, optional
+            Title name of the panel
+        border_style: str, optional
+            Style and color of the panel
 
         ---
         Notes
         -----
-        - If *ANSI* formatting is allowed, the error message will be
-        colored red.
+        - Rich styling commands can be inserted into **text**.
 
         """
 
-        if self._ansi:
-            print(f"\033[91;1;4mERR:\033[0;1;91m {error}\033[0m")
-        else:
-            error = compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])').sub(
-                '', error)
-            print(f"ERR: {error}")
-        self.logEvent(f"ERROR: {error}")
-
-    def logEvent(self, event: str):
-        """Saves events and writes them into a logfile (if available).
-
-        ...
-
-        ---
-        Parameters
-        ---------
-        event : str
-            Event information that gets stored
-
-        ---
-        See Also
-        --------
-        printInfo : Outputs a server message
-        statusInfo : Outputs a state of the client
-        warningInfo : Outputs a warning
-        errorInfo : Outputs an error
-        """
-
-        event = compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])').sub(
-                '', event)
-        event = f"{datetime.now().strftime('%H:%M:%S:%f')}>  {event}\n"
-        self._log.append(event)
-        if self.logfile != "":
-            with open(self.logfile, 'a') as log:
-                log.write(event)
-        # Warn about log size
-        if len(self._log) % 10_000 == 0 and len(self._log) > 200_000:
-            if self.logfile != "":
-                self._log = []
-                self.statusInfo(
-                    f"Clearing internal log (size: {len(self._log)}) since "
-                    + f"events get stored to '{self.logfile}'")
-            else:
-                self.warningInfo(
-                    "Log holds many entries. Consider storing to a file.")
+        self.rich_console.print(Panel(text, expand=False,
+                                      border_style=border_style, title=header))
 
 
 class Server:
@@ -1858,6 +1862,8 @@ class Server:
         Allowed ports to bind the server to
     preferreddataport : str
         Allowed ports to bind datasocks to
+    rich_console : rich.Console
+        Console for outputs
     se_commands : dict
         Data of servercommands
         dict[name:str, tuple[list[func:Callable, call_as_thread:bool,
@@ -1870,7 +1876,7 @@ class Server:
         Data that can be requested by clients
         dict[name:str, data:object]
     se_running : bool
-        Server is running
+        Server is online and its services can be used
     se_sep : str
         Separator used to identify the end of transmitted bytes
     serversocks : dict
@@ -1886,8 +1892,6 @@ class Server:
         Server starttime
     username : str
         Name of the server
-    _log : list[str]
-        Saves all occurred events
     _min_username_length : int
         Minimum characters a username can have
     _max_username_length : int
@@ -1895,6 +1899,13 @@ class Server:
     _open_requests : dict
         Unanswered requests to get data from a client socket
         dict[id:str, request_or_data:Any]
+    _no_user_connected_event : threading.Event
+        Event states no user is currently connected
+    _no_bound_socket_event : threading.Event
+        Event states that the server has no bound server- and datasocket
+    _services_stopped_event : threading.Event
+        Event states that the services are stopped
+
     RESTRICTED_NAMES : list[str]
         Names that are not allowed as usernames
 
@@ -1944,7 +1955,6 @@ class Server:
     - s.shutdown()
     - s.storelog()
     - s.attributes()
-    - s.errortrace()
     - s.getadminkey()
     - s.help(servercommand[o][r])
     - s.info(username[o][r])
@@ -1991,14 +2001,18 @@ class Server:
     >>> s.shutdownServer()
     """
 
-    __version__ = '7.43.162'
+    __version__ = '7.43.166'
+    RESTRICTED_NAMES = [  # In lower case
+        'server', 'mainserver', 'subserver', 'parent', 'higher', 'services',
+        'info', 'command', 'commands', 'servercommand', 'servercommands',
+        'requestable', 'requestables']
 
     def __init__(self, servername: str = 'server', description: str = "None",
                  adminkey: str = '', max_datasize: int = 1024,
                  preferredport: int | str | Iterable[int]=  '>4000',
                  preferreddataport: int | str | Iterable[int] = '<3999',
-                 startserver: bool = False, logfile: str = '',
-                 ansi: bool = True,*args, **kwargs):
+                 start_server: bool = False, logfile: str = '',
+                 *args, **kwargs):
         """...
 
         ---
@@ -2016,12 +2030,10 @@ class Server:
             Allowed ports to bind the server to
         preferreddataport : int | str | Iterable[int], optional
             Allowed ports to bind datasocks to
-        startserver : bool, optional
+        start_server : bool, optional
             Start server with preferred settings after initialization
         logfile : str, optional
             Path to file that stores all events
-        ansi : bool, optional
-            Allow *ANSI* text formatting
 
         ---
         Raises
@@ -2060,9 +2072,7 @@ class Server:
         self.adminkey = adminkey
         self.description = description
         self.logfile = logfile
-        self._ansi = ansi
 
-        self._log: list[str] = []
         self.services: dict[str, list[Callable | bool]] = {}
         self.serversocks: dict[str, tuple[socket, bool, bool]] = {}
         self.conns: dict[str, dict[str, Any]] = {}
@@ -2079,16 +2089,34 @@ class Server:
         self.services_active: bool = False
         self._se_sep: str = eval("'<$' + 'SEP' + '$>'")
 
-        # Fixes ANSI formatting bug on windows
-        if self._ansi: system("")
+        self._no_user_connected_event = Event()
+        self._services_stopped_event = Event()
+        self._no_bound_socket_event = Event()
+        self._no_user_connected_event.set()
+        self._services_stopped_event.set()
+        self._no_bound_socket_event.set()
 
-        Server._initServices(self)
-        Server._initServercommands(self)
-        Server._initServerRequestables(self)
-
-        if self.logfile != '':
-            self.statusInfo(f"Storing logfile at '{self.logfile}'")
-            open(self.logfile, 'w').close()
+        # Setup console formatting and logging
+        self.logger = getLogger(str(time()))
+        self.rich_console = Console()
+        if not self.logger.handlers:
+            handler = RichHandler(console=self.rich_console, show_time=True,
+                                show_level=True, markup=True,
+                                rich_tracebacks=True)
+            handler.setFormatter(Formatter("%(message)s", datefmt="[%X]"))
+            self.logger.addHandler(handler)
+            logging_level = "INFO"
+            if logfile != '':
+                logging_level = "DEBUG"
+                file_handler = FileHandler(logfile, mode="w")
+                file_handler.setLevel(logging_level)
+                file_handler.setFormatter(
+                    Formatter("[%(asctime)s] %(levelname)-8s %(message)-64s "
+                              + "<%(funcName)s:%(lineno)d>",
+                            "%Y-%m-%d %H:%M:%S"))
+                self.logger.addHandler(file_handler)
+            self.logger.setLevel(logging_level)
+            handler.setLevel(logging_level)
 
         # Initialization checks
         if max_datasize < 100:
@@ -2113,9 +2141,15 @@ class Server:
                 raise ValueError(
                     "The preferred data port can only contain the non-numerics"
                     + " '<', '>' or '=' at the FIRST position")
-        self.logEvent(f"Server ({Server.__version__}) loaded")
+        self.RESTRICTED_NAMES = [n.lower() for n in self.RESTRICTED_NAMES]
 
-        if startserver:
+        Server._initServices(self)
+        Server._initServercommands(self)
+        Server._initServerRequestables(self)
+
+        self.logger.debug(f"Server ({Server.__version__}) loaded")
+
+        if start_server:
             self.startServer()
 
     def startServer(self, port: int | str | Iterable[int] = 'preferred',
@@ -2182,9 +2216,8 @@ class Server:
         """
 
         if self.se_running:
-            self.warningInfo("Server is already running")
+            self.log_warning("Server is already started")
             return
-        self.logEvent("Starting server")
 
         # parse useable (data)ports
         if port == 'preferred':
@@ -2203,39 +2236,46 @@ class Server:
         s.close()
         del s
 
-        # Connect serversock
-        self.logEvent("Binding sockets")
-        serversock = socket(AF_INET, SOCK_STREAM)
-        for p in port:
-            if p < 0 or p > 65535:
+        with self.rich_console.status("[cyan]Starting server") as status:
+            # Bind serversock
+            status.update("[cyan]Binding sockets")
+            serversock = socket(AF_INET, SOCK_STREAM)
+            for p in port:
+                if p < 0 or p > 65535:
+                    self.log_warning(f"Port {p} is not allowed")
+                    continue
+                try:
+                    serversock.bind((ip, p))
+                    self.addr = (ip, int(p))
+                    self.logger.debug(f"Serversock bound to {self.addr[1]}")
+                    status.update(f"Serversock bound to {self.addr[1]}")
+                    break
+                except OSError:
+                    self.logger.debug(f"Port {p} is used")
+            else:
+                self.log_error("Can't bind server to any preferred port")
                 raise OSError(
-                    "Can't start server, all allowed/available ports are used")
-            try:
-                serversock.bind((ip, p))
-                self.addr = (ip, int(p))
-                self.statusInfo(f"Serversock bound to {self.addr[1]}")
-                break
-            except OSError:
-                self.logEvent(f"port {p} is used")
-        else:
-            self.errorInfo("Can't bind server to any preferred port")
-            raise OSError(
-                "Can't start server, all preferred/allowed ports are used")
-
-        serversock.listen(10)
-        self.se_running = True
-        self._starttime = time()
-        self.serversocks['Serversock'] = (serversock, True, True)
-        Thread(target=self._acceptClient, name=f'Connect_{self.addr[1]}'
-        ).start()
-        self.statusInfo(f"Server is running at {self.addr}")
-        if maindatasock:
-            maindata = self.bindMaindataSock(dataport)
-            if maindata is None:
-                self.errorInfo("Maindatasock could not get bound")
-        if services:
-            Thread(target=self.servicesController, name='Service'
+                    "Can't start server, all preferred/allowed ports are used")
+            status.update("[cyan] Completing startup")
+            serversock.listen(10)
+            self.se_running = True
+            self._starttime = time()
+            self._no_bound_socket_event.clear()
+            self.serversocks['Serversock'] = (serversock, True, True)
+            Thread(target=self._acceptClient, name=f'Connect_{self.addr[1]}'
             ).start()
+
+            status.update("[cyan] Checking additional settings")
+            if maindatasock:
+                maindata = self.bindMaindataSock(dataport)
+                if maindata is None:
+                    self.log_warning("Maindatasock could not get bound")
+            if services:
+                Thread(target=self.servicesController, name='Service'
+                ).start()
+            self.log_info(f"Server is running at {self.addr}")
+            self.panel_output("[cyan][bold]Server is online",
+                            "Status", "cyan")
 
     def restartServer(self):
         """Restarts the server.
@@ -2259,22 +2299,25 @@ class Server:
         >>> s.restartServer()
         """
 
+        self.panel_output("[cyan][bold]Restarting Server", "Status", "cyan")
+        _preferredport = self.preferredport
+        _preferreddataport = self.preferreddataport
+        _services = self.services_active
+        _maindatasock = False if self.getSockData(name="Maindata") == None \
+                              else True
+
+        def mute(server, arg1, arg2=None, arg3=None): pass
+        self.panel_output = mute.__get__(self, type(self))
         self.shutdownServer()
-        self.statusInfo("Restarting Server")
-        if self.logfile != '':
-            temp = self.logfile.split('.', 1)
-            if len(temp) == 2:
-                self.logfile = f'{temp[0]}_restart{temp[1]}'
-            else:
-                self.logfile += '_restart'
 
         try:
             self = self.__class__(*self._init_args, **self._init_kwargs)
         except Exception as e:
-            self.errorInfo("Failed to restart server object"
-                           + f"'{self.__class__}' due to: {str(e)}")
-            self.warningInfo("Binding server with previous settings")
-        self.startServer()
+            self.log_error("Failed to restart server object"
+                        + f"'{self.__class__}' due to: {str(e)}")
+            self.log_warning("Reusing previous server object/settings")
+        self.startServer(_preferredport, _preferreddataport,  _maindatasock,
+                         _services)
 
     def shutdownServer(self):
         """Disconnects all users, unbinds socks and ends services.
@@ -2288,6 +2331,13 @@ class Server:
         restartServer : Restarts the server
 
         ---
+        Notes
+        -----
+        - Calling this on an inactive Server will hard reset all properties
+        related to connections. This may cause sockets to not close correctly
+        if there are still connections.
+
+        ---
         Examples
         --------
         >>> s = Server("server")
@@ -2295,36 +2345,57 @@ class Server:
         >>> s.shutdownServer()
         """
 
+        was_running = self.se_running
         if not self.se_running:
-            self.warningInfo(
-                "Server is not running, shutdown resets attributes")
-        self.statusInfo("Shutting Server down")
-        self.statusInfo("Stopping services")
-        self.services_active = False
-        self.statusInfo("Disconnecting all users")
-        self.se_running = False
-        self.services_active = False
-        for clientid in [key for key in self.conns]:
-            self.sendCommandTo(self.mainSocketof(clientid),  # type: ignore
-                               "disconnect")
-            try:
-               self.mainSocketof(clientid).close()  # type: ignore
-            # Client has disconnected
-            except (ValueError, KeyError, AttributeError):
-                pass
-        while len(self.conns) > 0:
-            sleep(0.001)
-        self.statusInfo("Unbinding all sockets")
-        [self.closeDataSock(name) for name in self.serversocks.copy()]
-        started = time()
-        while len(self.serversocks) > 0:
-            sleep(0.001)
-            if time() - started > 1:
-                self.errorInfo("Serversockets are not closing correctly")
-                return
-        self.statusInfo("Server is inactive")
+            self.log_info("Server is not running")
+            self.logger.debug("Reset Server variables")
+            if len(self.conns) > 0:
+                self.logger.debug(f"Cleared {len(self.conns)} connections")
+            if len(self.serversocks) > 0:
+                self.logger.debug(f"Cleared {len(self.serversocks)} sockets")
+            self.conns = {}
+            self.serversocks = {}
+        else:
+            self.log_info("Shutting Server down")
 
-    def bindMaindataSock(self, dataport: int | str | Iterable = 'preferred'):
+        self.services_active = False
+        self.se_running = False
+
+        if not was_running:
+            return
+
+        with self.rich_console.status("[cyan]Shutting down") as status:
+            status.update("[cyan]Stopping services")
+            if self.services_active:
+                self.logger.debug("Stopping services")
+            if not self._services_stopped_event.wait(5):
+                self.log_warning("Skipping services due to timeout")
+
+            status.update("[cyan]Disconnecting users")
+            self.logger.debug("Disconnecting all users")
+            for clientid in [key for key in self.conns]:
+                self.sendCommandTo(self.mainSocketof(clientid),  # type: ignore
+                                "disconnect")
+                try:
+                    self.mainSocketof(clientid).close()  # type: ignore
+                # Client has disconnected
+                except (ValueError, KeyError, AttributeError):
+                    pass
+            if not self._no_user_connected_event.wait(5):
+                self.log_warning("Users were not disconnected correctly")
+
+            status.update("[cyan]Unbinding sockets")
+            self.logger.debug("Unbinding all sockets")
+            [self.closeDataSock(name) for name in self.serversocks.copy()]
+            if not self._no_bound_socket_event.wait(5):
+                self.log_warning("Serversockets are not closing correctly")
+                return
+
+            self.logger.debug("Server is inactive")
+        self.panel_output("[cyan][bold]Server is offline", "Status", "cyan")
+
+    def bindMaindataSock(self, dataport: int | str | Iterable = 'preferred'
+                         ) -> Optional[socket]:
         """Initiates the maindatasock.
 
         ...
@@ -2358,13 +2429,13 @@ class Server:
         if dataport == 'preferred':
             dataport = self.preferreddataport
         if 'Maindata' in self.serversocks:
-            self.warningInfo("The maindatasock is already initiated")
+            self.log_warning("The maindatasock is already initiated")
             return None
         maindatasock = self.newDataSock('Maindata', self.recvClientData,
             dataport=dataport, connect_clients=self.conns.keys(), #type: ignore
             connect_new_clients=True, show_info=True)
         if maindatasock is None:
-            self.errorInfo("Maindatasock could not get bound")
+            self.log_error("Maindatasock could not get bound")
         return maindatasock
 
     def newDataSock(self, sockname: str,
@@ -2451,35 +2522,34 @@ class Server:
 
         # Preparations
         if self.getSockData(sockname) is not None:
-            self.errorInfo(f"A datasock '{sockname}' already exists")
+            self.log_warning(f"A datasock '{sockname}' already exists")
             raise NameError(f"A datasock '{sockname}' already exists")
         if recvFunc == 'default':
             recvFunc = self.recvClientData
         if isinstance(connect_clients, str):
             connect_clients = [connect_clients]
         if dataport == 'preferred':
-            port = self.preferreddataport
+            dataport = self.preferreddataport
         datasock = socket(AF_INET, SOCK_STREAM)
         maindatasock_port = self.getMainDataPort()
 
         # Bind sock
+        self.logger.debug(f"Binding new datasock '{sockname}'")
         for try_port in self._parse_port_expression(dataport):
-            if try_port < 0 or try_port > 65535:
-                self.errorInfo(
-                    f"No ports available for datasock '{sockname}'")
-                return None
             try:
-                datasock.bind((self.addr[0], try_port))
-                self.statusInfo(f"{sockname} Datasock bound to {try_port}")
+                datasock.bind((self.addr[0], try_port))  # type: ignore
+                self.log_info(f"'{sockname}' Datasock bound to {try_port}")
                 break
             except OSError:
-                pass
+                self.logger.debug(
+                    f"Cound not bind '{sockname}' to port '{try_port}'")
         else:
-            self.errorInfo(
+            self.log_error(
                 f"Can't bind datasock '{sockname}' to any allowed port")
             return None
 
         datasock.listen(10)
+        self._no_bound_socket_event.clear()
         self.serversocks[sockname] = (datasock, connect_new_clients, show_info)
         sock_addr = datasock.getsockname()
         Thread(
@@ -2497,7 +2567,7 @@ class Server:
                     'newdatasock',
                     [sock_addr])
             except KeyError:
-                self.warningInfo("Could not connect a clientid to new"
+                self.log_warning("Could not connect a clientid to new"
                                  + f" datasocket '{sockname}'")
         return datasock
 
@@ -2525,16 +2595,18 @@ class Server:
         """
 
         port = self.serversocks[datasock][0].getsockname()[1]
-        self.statusInfo(f"Closing datasock '{datasock}' at {port}")
 
         # Disconnect all clientsocks
         for clientid in self.conns:
             if port in self.conns[clientid]['socks']:
                 self.getSocketof(clientid, port).close()
 
-        # Close and remove serversock
+        # Close and remove datasock
         self.serversocks[datasock][0].close()
         del self.serversocks[datasock]
+        if len(self.serversocks) == 0:
+            self._no_bound_socket_event.set()
+        self.log_info(f"Closed datasock '{datasock}'")
 
     # -----------------------------+
     # Connect and interact methods |
@@ -2565,7 +2637,7 @@ class Server:
                 except OSError:  # The server gets shut down
                     return
                 if self.se_running:
-                    self.logEvent(f"New connection with {ip}")
+                    self.logger.debug(f"New client connection with {ip}")
                     Thread(
                         target=self._registrateClient,
                         args=(client,),
@@ -2575,9 +2647,9 @@ class Server:
 
             except (OSError, IndexError):  # Client closed socket
                 if self.se_running:
-                    self.logEvent(f"Lost connection with a new client({ip}) "
-                                   + "on The Serversocket"
-                                   + sock.getsockname()[1])
+                    self.logger.debug(
+                        f"Lost connection with a new client({ip}) on the "
+                        + "Serversocket" + sock.getsockname()[1])
 
     def _acceptSocket(self, datasock: socket, handler: Callable,
                      show_info: bool = False):
@@ -2622,6 +2694,7 @@ class Server:
                 except OSError:  # The server gets shut down
                     return
                 if self.se_running:
+                    self.logger.debug(f"New datasock connection with {ip}")
                     Thread(
                         target=self._registrateSocket,
                         args=(sock, datasock, handler, show_info),
@@ -2630,7 +2703,7 @@ class Server:
                     ).start()
             except (OSError, IndexError):  # Client closed socket
                 if self.se_running and show_info:
-                    self.logEvent(
+                    self.logger.debug(
                         f"Lost connection with unidentified new datasock({ip})"
                         + f"on the Server-socket {datasock.getsockname()[1]}")
 
@@ -2680,7 +2753,7 @@ class Server:
                 client.settimeout(None)
             except TimeoutError:
                 client.close()
-                self.connectionInfo(
+                self.logger.debug(
                     f"{client_addr[0]} is unsuited for the server")
                 return
 
@@ -2688,19 +2761,19 @@ class Server:
             conntype, version = client.recv(64).decode().split('|', 1)
             version = version.split('.')
             if conntype == 'SERVERFINDER':
-                self.logEvent(
+                self.logger.debug(
                     f"{client_addr[0]} searches server and disconnected")
                 raise ConnectionResetError
             elif (conntype == 'CLIENT' or conntype == 'SUBSERVER') \
                     and int(version[0]) < 6 and int(version[1]) < 26:
-                self.logEvent(client_addr[0] + " is not compatible")
+                self.logger.debug(f"'{client_addr[0]}' is not compatible")
                 raise ConnectionAbortedError
 
             # Exchange serverdata
             binary_serverdata = dumps(self.getServerData())
             if len(binary_serverdata) > 4096:
-                self.errorInfo("Serverdata is larger than 4096 bytes and "
-                               + f"registering {client_addr[0]} will fail.")
+                self.log_error("Serverdata is larger than 4096 bytes and "
+                               + f"registration {client_addr[0]} will fail.")
                 raise ConnectionAbortedError
             client.send(binary_serverdata)
 
@@ -2732,13 +2805,12 @@ class Server:
 
         except (ConnectionResetError, ConnectionAbortedError, EOFError):
             if conntype != 'SERVERFINDER':
-                self.connectionInfo(client_addr[0]
-                                    + " disconnected during registration")
+                self.logger.debug(
+                    f"'{client_addr[0]}' disconnected during registration")
             client.close()
             return
 
         # PASSED REGISTRATION
-
         conn_entry = {
             'name': username,
             'socks': {self.addr[1]: client},
@@ -2749,10 +2821,14 @@ class Server:
             'muted': False,
             'connecttime': time(),
             'ping': -0.001,
+            'event': {
+                'no_socks': Event()
+            },
             'data': {  # Array holds data for different use cases
                 'recv_buffer': {},  # Buffers received data per socket
                 'recv_packets': {}  # Holds incomplete data per socket
             }}
+        self._no_user_connected_event.clear()
         self.conns[conn_id] = conn_entry
 
         # Connect serverdatasockets
@@ -2764,25 +2840,21 @@ class Server:
                     [sockdata[0].getsockname()])
 
         # Ping socket
-        if 'Maindata' in self.serversocks:
-            started = time()
-            while self.getMainDataPort() not in conn_entry['socks']:
-                sleep(0.001)
-                if time() > started + 1.0:
-                    break
-            else:
-                self.conns[conn_id]['ping'] = self.pingSocket(
-                    self.mainDataSockOf(conn_id))
-        else:
-            started = time()
-            self.sendDataTo(client, ['<$REQUEST$>', 'request', '0', 'PING'])
-            client.recv(128)
-            self.conns[conn_id]['ping'] = time() - started
+        started = time()
+        self.sendDataTo(client, ['<$REQUEST$>', 'request', '0', 'PING'])
+        client.recv(128)
+        self.conns[conn_id]['ping'] = time() - started
 
         # Welcome text
         if username_changed_info != "":
             self.sendMsgTo(conn_id, username_changed_info)
-        self.connectionInfo(f"{client_addr[0]} is registered as '{username}'")
+
+        self.log_connection_info(f"{client_addr[0]} registered as '{username}'")
+        self.panel_output(
+            f"[yellow]{self.conns[conn_id]['clientdata']['conntype']} "
+            + f"[bold][underline]{username}[/bold][/underline] "
+            + f"[italic]({client_addr[0]})[/italic] connected",
+            "Connection", "yellow")
         self.sendMsgTo(conn_id, f"Connected to {self.username}")
         self.sendMsgTo(conn_id, f"Registered as '{username}'")
         self.sendMsgTo(conn_id, "Type 's.help()' for more information")
@@ -2840,7 +2912,7 @@ class Server:
             datasocket.settimeout(None)
         except (TimeoutError, UnicodeDecodeError):
             if show_info:
-                self.connectionInfo(
+                self.log_connection_info(
                     datasocket.getsockname()[0]
                     + " is unsuited for sock '"
                     + self.getSockData(port=serversock.getsockname()[1])[3]
@@ -2857,7 +2929,7 @@ class Server:
             user_id = self.getIDof(addr=user_addr)
             self.conns[user_id]['socks'][port] = datasocket
             if show_info:
-                self.logEvent("User '" + self.conns[user_id]['name']
+                self.logger.debug("User '" + self.conns[user_id]['name']
                               + "' connected a new datasocket at port "
                               + str(serversock.getsockname()[1]))
             Thread(
@@ -2868,7 +2940,7 @@ class Server:
                     datasocket.getsockname()[0].split('.')[-1])
             ).start()
         except (ConnectionResetError, ConnectionAbortedError, OSError):
-            self.logEvent("An unassociated socket on datasock"
+            self.logger.debug("An unassociated socket on datasock"
                 + f"'{self.getSockData(port=port)[3]}' ({port}) disconnected")
 
     def disconnectConn(self, clientid: str):
@@ -2967,14 +3039,16 @@ class Server:
                     recvFunc(self, datasocket, clientid, *args, **kwargs)
                 raise ConnectionResetError
             except (ConnectionResetError, ConnectionAbortedError, OSError):
-                self.logEvent(
-                    f"Terminated socket ({port}) for user '"
-                    + self.conns[clientid]['name'] + "'")
+                self.logger.debug(
+                    f"Disconnected '{self.conns[clientid]['name']}' from "
+                    + self.getSockData(port=port)[3])
                 datasocket.close()
                 del self.conns[clientid]['data']['recv_buffer'][port]
                 del self.conns[clientid]['data']['recv_packets'][port]
             if clientid in self.conns:
                 del self.conns[clientid]['socks'][port]
+                if len(self.conns[clientid]['socks']) == 0:
+                    self.conns[clientid]['event']['no_socks'].set()
         return inner
 
     @recvFuncWrapper
@@ -3015,7 +3089,7 @@ class Server:
         """
 
         data = datasocket.recv(bytes)
-        self.printInfo(data.decode())
+        self.text_output(data.decode())
 
     @recvFuncWrapper
     def recvClientData(self, datasocket: socket, clientid: str):
@@ -3051,8 +3125,8 @@ class Server:
         - This is the default function to receive data *(recvFunc)*.
         - The suited send Function is `Client.sendData()`
         - A packet ends with the separator *_se_sep*
-        - Received text messages will be *ANSI* formatted (if *ANSI* is
-        enabled).
+        - Received text messages with *ansi* codes will be formatted and
+        displayed.
 
         ---
         Examples
@@ -3063,7 +3137,7 @@ class Server:
         connected_port = datasocket.getsockname()[1]
         buffer = self.conns[clientid]['data']['recv_buffer'][connected_port]
         if len(self.conns[clientid]['data']['recv_packets']) > 16:
-            self.warningInfo(
+            self.log_warning(
                 f"Sock '{self.getSockData(port=connected_port)[3]}' "
                 + "has many uncompleted transmission packets")
         buffer += datasocket.recv(self.se_max_datasize)
@@ -3078,7 +3152,7 @@ class Server:
             try:
                 packet = loads(packet)
             except UnpicklingError:
-                self.warningInfo(
+                self.log_warning(
                     f"A received packet from '{self.conns[clientid]['name']}' "
                     + f"on sock '{self.getSockData(port=connected_port)[3]}' "
                     + "cannot be decoded")
@@ -3106,7 +3180,7 @@ class Server:
             try:
                 data = loads(packet[3])
             except UnpicklingError:
-                self.warningInfo(
+                self.log_warning(
                     f"Received data from '{self.conns[clientid]['name']}' on "
                     + f"sock '{self.getSockData(port=connected_port)[3]}' is "
                     + "unreadable and will be ignored")
@@ -3120,18 +3194,15 @@ class Server:
                     command, command_args = data[:-1].replace(' ', '').split(
                         '(', 1)
                     command_args = command_args.split(',')
-                    message = (f"\033[0;1;4m{command}\033[0m(\033[3m"
-                            + "\033[0m, \033[3m".join(command_args)
-                            + "\033[0m)")
+                    message = f"{command}("+ ", ".join(command_args) + ")"
                 # Format normal text
                 else:
-                    message = data + '\033[0m'
-                    self.sendMsgTo(clientid, "\033[3mReceived:\033[0m " + data)
-                self.printInfo(
+                    message = data
+                    self.sendMsgTo(clientid, "Received:" + data)
+                self.text_output(
                     message,
-                    sender=f"\033[0;1m[\033[4;53m"
-                        + f"{datetime.now().strftime('%H:%M:%S')}\033[0m]"
-                        + f"\033[3m{self.conns[clientid]['name']}\033[0m: ")
+                    sender=f"[{datetime.now().strftime('%H:%M:%S')}]"
+                    + f"{self.conns[clientid]['name']}")
 
             # Process a request
             if isinstance(data, list) and data[0] == '<$REQUEST$>':
@@ -3152,10 +3223,12 @@ class Server:
                     if data[2] in self._open_requests:
                         self._open_requests[data[2]] = data[3]
                     else:
-                        self.warningInfo(
-                            "Received requested data after timeout")
+                        self.log_warning(
+                            f"Received requested data from '"
+                            + self.conns[clientid]['username']
+                            + "' after timeout")
                 else:
-                    self.errorInfo(f"Invalid request phrase '{data[1]}'")
+                    self.log_error(f"Invalid request phrase '{data[1]}'")
 
             # Process a servercommand
             elif isinstance(data, str) and len(data) > 0 \
@@ -3170,7 +3243,7 @@ class Server:
 
             # Data(type/-format) can't be processed
             elif not isinstance(data, str):
-                    self.warningInfo(
+                    self.log_warning(
                         "Could not identify the purpose of a "
                         + f"{type(data)} obj sent by user '"
                         + self.conns[clientid]['name'] + "'")
@@ -3180,6 +3253,12 @@ class Server:
         """Receives messages (and data) for a client on the serversock.
 
         ...
+
+        This is the receiving function for clients on the serversock.
+        All interactions are handled by the default receiving function
+        `recvClientData()`. This function disconnects the client from
+        the server *(and every datasock)* if the connection to the
+        serversock terminates for any reason.
 
         ---
         Parameters
@@ -3193,29 +3272,19 @@ class Server:
         See Also
         --------
         recvClientData : Receives and evaluates data for a sock
-
-        ---
-        Notes
-        -----
-        - This is the default recvFunc of the serversock
-        - This calls the standard receiving function `recvClientData()`
-        (which is wrapped by `recvFuncWrapper`).
-        - If the connection to the serversock is lost, the client with
-        all sockets get disconnected.
         """
 
         self.recvClientData(sock, clientid)
-        # Remove whole client if serversock connection fails
-        started = time()
-        while len(self.conns[clientid]['socks']) > 0:
-            sleep(0.001)
-            if time() - started > 0.5:
-                self.errorInfo("Unable remove datasockets for '"
+
+        # Remove whole client if lost connection to serversock
+        if not self.conns[clientid]['event']['no_socks'].wait(0.5):
+            self.log_error("Unable to remove datasockets for '"
                                + self.conns[clientid]['name'] + "'")
-                break
-        self.connectionInfo("Disconnected connection '"
+        self.log_connection_info("Disconnected connection '"
                             + self.conns[clientid]['name'] + "'")
         del self.conns[clientid]
+        if len(self.conns) == 0:
+            self._no_user_connected_event.set()
 
     def sendDataTo(self, clientsocket: socket | str, data: Any):
         """Sends data through a server sock to the client.
@@ -3269,7 +3338,7 @@ class Server:
         try:
             data = dumps(data)
         except PicklingError:
-            self.errorInfo("Transmitting data cannot be converted to bytes")
+            self.log_error("Could not binary encode data for transmit")
             return
         # Data can't contain the original separator to be usable
         data = data.replace(self._se_sep.encode(),
@@ -3297,12 +3366,13 @@ class Server:
         except Exception as e:
             clientid = self.getIDof(socket=clientsocket)
             if clientid in self.conns:
-                self.errorInfo("Senderror while sending to '"
+                self.log_error("Senderror while sending to '"
                                + self.conns[clientid]['name'] + "':  "
-                               + str(e))
+                               + f"[italic]{str(e)}")
             else:
-                self.warningInfo("Senderror for a disconnected client")
-            self.logEvent(f"Occurred error: {e}")
+                self.logger.debug(
+                    "Unfinished transmission to a disconnected client")
+            self.logger.debug(f"Occurred error: {e}")
 
     def sendMsgTo(self, clientid: str, message: str):
         """Sends a message to a client through the serversock.
@@ -3453,7 +3523,8 @@ class Server:
         """
 
         if len(self._open_requests) > 50:
-            self.warningInfo(f"Many{len(self._open_requests)} open requests")
+            self.log_warning(
+                f"Many open requests ({len(self._open_requests)})")
         try:
             if isinstance(clientsocket, str):
                 id = clientsocket
@@ -3461,7 +3532,7 @@ class Server:
             else:
                 id = self.getIDof(socket=clientsocket)
             if self.conns[id]['muted']:
-                self.warningInfo("The user '" + self.conns[id]['name']
+                self.log_warning("User '" + self.conns[id]['name']
                                  + "' is muted and requests can't be answered")
 
             # Send request
@@ -3476,7 +3547,7 @@ class Server:
                 if timeout is not None \
                 and time() - starttime >= timeout:
                     if self.getIDof(socket=clientsocket) is not None:
-                        self.warningInfo(
+                        self.log_warning(
                             f"Request for '{requested}' did not receive data")
                     if get_time:
                         return None, time() - starttime
@@ -3535,13 +3606,13 @@ class Server:
         elif newname.lower() in self.RESTRICTED_NAMES:
             raise ValueError(f"The username '{newname}' is a restricted name")
 
-        self.connectionInfo(f"User '{self.conns[clientid]['name']}' changed "
+        self.log_connection_info(f"User '{self.conns[clientid]['name']}' changed "
                             + f"name to '{newname}'")
         self.conns[clientid]['name'] = newname
         self.sendCommandTo(self.mainDataSockOf(clientid), 'changename',
                            [newname])
         self.sendMsgTo(
-            clientid, f"Your username changed to '\033[1m{newname}\033[0m'")
+            clientid, f"Your username changed to {newname}'")
 
     # --------------------------------+
     # Servercommand and -requestables |
@@ -3645,23 +3716,23 @@ class Server:
             optional_args = [optional_args]
 
         if '' in args + optional_args + [repeatable_arg]:
-            self.warningInfo(
+            self.log_warning(
                 f"Defining servercommand '{name}' with an empty str argument")
 
         if name in self.se_commands and not overwrite:
-            self.warningInfo(f"Servercommand '{name}' already exists and needs"
+            self.log_warning(f"Servercommand '{name}' already exists and needs"
                            + " to be overwritten to change it")
         elif not name.startswith('s.'):
             raise NameError(f"Servercommand '{name}' needs to start with"
                            + " 's.' to be callable")
         elif not (isinstance(repeatable_arg, type(None)) or optional_args == []
         ) and not repeatable_arg == optional_args[-1]:
-            self.errorInfo(
+            self.log_error(
                 f"Repeatable argument '{repeatable_arg}' must be last "
                 + "optional argument (for servercommand '{name}')")
         else:
             if name not in self.se_commands and overwrite:
-                self.warningInfo(
+                self.log_warning(
                     f"Creating new servercommand since no '{name}' exists")
             self.se_commands[name] = (
                 action, call_as_thread, needed_permission,
@@ -3741,11 +3812,11 @@ class Server:
         """
 
         if name in self.se_requestables and not overwrite:
-            self.warningInfo(f"Requestable '{name}' already exists and needs"
+            self.log_warning(f"Requestable '{name}' already exists and needs"
                              + " to be overwritten to change it")
             return
         if name not in self.se_requestables and overwrite:
-            self.warningInfo("Creating new requestable since no key "
+            self.log_warning("Creating new requestable since no key "
                              + f"'{name}' exists")
         self.se_requestables[name] = data
 
@@ -3801,7 +3872,6 @@ class Server:
         - s.shutdown()
         - s.storelog(filename[o])
         - s.attributes()
-        - s.errortrace()
         - s.getadminkey()
         - s.help(servercommand[o][r])
         - s.info(entity[o][r])
@@ -3842,22 +3912,22 @@ class Server:
             if len(args) == 0:
                 self.sendMsgTo(
                     clientid,
-                    "\033[1;4mSERVER HELP\033[0;1m:\033[0m\n"
+                    "SERVER HELP:\n"
                     + "  If you don't know how to interact/operate this\n"
                     + "  server then please refer to the usage examples on\n"
                     + "  https://github.com/OmegaDawn/localthingsnet \n\n"
                     + "  Information about the server and the underlying\n"
                     + "  project can be gained by sending "
-                    +"'\033[1ms.help(server)\033[0m'\n"
-                    + "  and '\033[1ms.help(project)\033[0m'. For available\n"
-                    + "  servercommands type '\033[1ms.help(commands)\033[0m'."
+                    +"'s.help(server)'\n"
+                    + "  and 's.help(project)'. For available\n"
+                    + "  servercommands type 's.help(commands)'."
                 )
 
             # Project information
             elif args[0] == 'project':
                 self.sendMsgTo(
                     clientid,
-                    "\033[1;4mLOCALTHINGSNETWORK PROJECT\033[0;1m:\033[0m\n"
+                    "LOCALTHINGSNETWORK PROJECT:\n"
                     + "  This is an application of the localthingsnet(work)\n"
                     +"  project(https://github.com/OmegaDawn/localthingsnet)\n"
                     + "  The project aims to provide a socket based\n"
@@ -3870,18 +3940,19 @@ class Server:
             elif args[0] == 'server':
                 self.sendMsgTo(
                     clientid,
-                    "\033[1;4mSERVER DESCRIPTION\033[0;1m:\033[0m\n"
+                    "SERVER DESCRIPTION:\n"
                     + f"  (Name: {self.username}, Type: {type(self).__name__})"
                     + f"\n    {self.description}")
 
             # Overall servercommand help
             elif args[0].lower() in ['command', 'commands', 'servercommands']:
                 send_text = (
-                    "\033[1;4mAVAILABLE SERVERCOMMANDS\033[0;1m:\033[0m"
-                    + '\n  Use "s.help(*command_name*)" for more'
-                    + "\n    information about that command"
-                    + "\n  Parameters with a '[o]' are optional"
-                    + "\n  Parameters with a '[r]' are repeatable\n")
+                    self.text_header_format("AVAILABLE SERVERCOMMANDS:")
+                    + "\n  Use 's.help(*command_name*)' for more"
+                    + "\n  information about that command"
+                    + "\n  Parameters with a '\[o]' are optional" #type: ignore
+                    + "\n  Parameters with a '\[r]' "  #type: ignore
+                    + "are repeatable\n")
 
                 # Group commands by their category
                 groups = {}
@@ -3907,7 +3978,7 @@ class Server:
             elif args[0] == '*command_name*':
                 self.sendMsgTo(
                     clientid,
-                    "'\033[1m*command_name*\033[0m' is not meant\n"
+                    "'command_name' is not meant\n"
                     + "  literally. Type something like to\n"
                     + " 's.help(s.info)' to get information about\n"
                     + "  that command. If you don't know any commands,\n"
@@ -3920,7 +3991,7 @@ class Server:
              # Category command help
             elif args[0].endswith(' commands'):
                 args[0] = args[0].replace(' commands', '')
-                category_commands = []
+                category_commands: list[str] = []
                 for command in self.se_commands.items():
                     if command[1][7] == args[0]:
                         category_commands.append(command[0])
@@ -3935,7 +4006,7 @@ class Server:
 
             # Specific servercommand help
             else:
-                info_str = "\033[1;4mSERVERCOMMAND INFO:\033[0m"
+                info_str = self.text_header_format("SERVERCOMMAND INFO:")
                 for command in args:
                     command = command.split('(', 1)[0]
                     if not command.startswith('s.'):
@@ -4084,7 +4155,7 @@ class Server:
 
         def kickip(clientid, args):
             for arg in args:
-                self.statusInfo(f"Disconnecting clients of '{arg}'")
+                self.log_info(f"Disconnecting clients of '{arg}'")
                 self.sendMsgTo(clientid, f"Disconnecting clients of '{arg}'")
                 for id in self.conns:
                     if self.conns[id]['addr'][0] == arg:
@@ -4127,7 +4198,7 @@ class Server:
                     self.sendMsgTo(
                         clientid,
                         "You are already connected with this address")
-                self.connectionInfo(
+                self.log_connection_info(
                     "'" + self.conns[clientid]['name']
                     + f"' is connecting to {args[0]} at port {args[1]}")
                 self.sendCommandTo(self.mainSocketof(clientid),  # type: ignore
@@ -4145,14 +4216,17 @@ class Server:
                 self.logfile = f'Serverlog_{self.addr[1]}.txt'
             else:
                 self.logfile = args[0]
-                if not self.logfile.endswith('.txt'):
-                    self.logfile += '.txt'
-            self.statusInfo(f"Saving events in '{self.logfile}'")
+            logging_level = "DEBUG"
+            self.logger.setLevel(logging_level)
+            file_handler = FileHandler(self.logfile, mode="w")
+            file_handler.setLevel(logging_level)
+            file_handler.setFormatter(
+                Formatter("[%(asctime)s] %(levelname)-8s %(message)s",
+                        "%Y-%m-%d %H:%M:%S"))
+            self.logger.addHandler(file_handler)
+            self.log_info(f"Saving events in '{self.logfile}'")
             self.sendMsgTo(clientid,
                                 f"Saving events in '{self.logfile}'")
-            with open(self.logfile, 'w') as file:
-                for event in self._log:
-                    file.write(event)
 
         def closedatasock(clientid, args):
             for arg in args:
@@ -4189,9 +4263,7 @@ class Server:
             and cl_data['shutdown_ack'] >= time() - 30:
                 for conn_id in self.conns:
                     self.sendMsgTo(
-                        conn_id,
-                        f"\033[1mServer '{self.username}' is shutting down"
-                        + "\033[0m")
+                        conn_id,  f"Server '{self.username}' is shutting down")
                 self.shutdownServer()
                 return
             elif 'shutdown_ack' in cl_data:
@@ -4201,20 +4273,8 @@ class Server:
                                + self.username
                                + "' by sending 's.shutdown()'.")
 
-        def trace(clientid):
-            error_trace = ''.join([event for event in self._log if (
-                'WARNING' in event or 'ERROR' in event)])
-            self.sendMsgTo(clientid,"\033[1mError trace for Server " +
-                               f"{self.username}:\033[0m")
-            if len(error_trace) > 0:
-                self.sendDataTo(self.mainSocketof(clientid),  # type: ignore
-                                error_trace)
-            else:
-                self.sendDataTo(self.mainSocketof(clientid),  # type: ignore
-                                "*No problems*")
-
         def attributes(clientid):
-            send_text = f"\033[1mAttributes of '{self.username}':\033[0m"
+            send_text = f"Attributes of '{self.username}':"
             send_text += "\n  Separator: " + self._se_sep
             send_text += "\n  Max datasize: " + str(self.se_max_datasize)
             send_text += "\n\n  Serverdata:"
@@ -4232,17 +4292,17 @@ class Server:
             self.sendMsgTo(clientid, send_text)
 
         def listthreads(clientid):
-            info_str = "\033[1mActive threads:\033[0m " + \
-                str(len(thread_enumerate()))
             thread_list = [th for th in thread_enumerate() if th.is_alive()]
+            info_str = self.text_header_format("ACTIVE THREADS:")
+            info_str +=f" ({len(thread_list)})"
             thread_list.sort(key=lambda thread_obj: thread_obj.name)
             for thread in thread_list:
                 info_str += ("\n  " + thread.name)
             self.sendMsgTo(clientid, info_str)
 
         def listsocks(clientid):
-            send_text = "\033[1mActive serversocks: (" + \
-                str(len(self.serversocks)) + ")\033[0m"
+            send_text = self.text_header_format("ACTIVE SOCKETS:")
+            send_text += f" ({len(self.serversocks)})"
             for (name, entry) in self.serversocks.items():
                 port = entry[0].getsockname()[1]
                 n_connected = 0
@@ -4252,7 +4312,7 @@ class Server:
                         n_connected += 1
                         connected_names.append(conn['name'])
                 send_text += (
-                    f"\n  {name} ({port})"
+                    f"\n  [underline]{name}[/underline] ({port})"
                     + f"\n    connected_users ({n_connected}):")
                 send_text += "\n      " + ", ".join(connected_names)
                 send_text += (
@@ -4305,11 +4365,11 @@ class Server:
                     if arg in self.services:
                         self.setServiceEnabled(arg, state)
                         if state:
-                            self.statusInfo(f"Enabled service '{arg}'")
+                            self.log_info(f"Enabled service '{arg}'")
                             self.sendMsgTo(
                                 clientid, f"Service '{arg}' is now activated")
                         else:
-                            self.statusInfo(f"Disabled service '{arg}'")
+                            self.log_info(f"Disabled service '{arg}'")
                             self.sendMsgTo(
                                 clientid,
                                 f"Service '{arg}' is now deactivated")
@@ -4462,11 +4522,7 @@ class Server:
             optional_args=['entity_name'],
             repeatable_arg='entity_name',
             category='statistic')
-        self.newServerCommand(
-            's.errortrace', "Shows error and warning trace",
-            lambda id, args: trace(id),
-            needed_permission='admin',
-            category='statistic')
+
         self.newServerCommand(
             's.attributes', "Shows useful attributes of the server",
             lambda id, args: attributes(id),
@@ -4539,7 +4595,8 @@ class Server:
         elif isinstance(arguments, str):
             arguments = []
         if command not in self.se_commands:
-            self.sendMsgTo(clientid, f"No Servercommand '{command}' available")
+            self.sendMsgTo(clientid,
+                           f"No Servercommand '{command}()' available")
             return
 
         # Check permissions
@@ -4550,6 +4607,8 @@ class Server:
                 clientid,
                 ', '.join(self.se_commands[command][2])
                 + f"' permissions needed for '{command}()'")
+            self.logger.debug(f"User '{self.conns[clientid]['name']}' has no "
+                              + f"permissions for {command}()")
             return
 
         # Check valid number of arguments
@@ -4573,6 +4632,8 @@ class Server:
             return
 
         # Execute
+        self.logger.debug(f"Executing '{command}' for user "
+                          + f"'{self.conns[clientid]['name']}'")
         if self.se_commands[command][1]:
             Thread(
                 target=self.se_commands[command][0],
@@ -4583,7 +4644,7 @@ class Server:
             try:
                 self.se_commands[command][0](clientid, arguments)
             except Exception as e:
-                self.errorInfo(f"Servercommanderror while executing "
+                self.log_error(f"Servercommanderror while executing "
                                + f"'{command}()': {e}")
                 self.sendMsgTo(clientid, "Error while executing "
                                    + f"'{command}()'")
@@ -4643,10 +4704,10 @@ class Server:
         """
 
         if name in self.services and not overwrite:
-            self.errorInfo(f"Service '{name}' already exists")
+            self.log_error(f"Service '{name}' already exists")
             return
         elif name not in self.services and overwrite:
-            self.warningInfo(
+            self.log_warning(
                 f"Creating new service '{name}' since it does not exist")
         self.services[name] = [service_func, as_thread, enabled]
 
@@ -4739,7 +4800,7 @@ class Server:
         """
 
         if not isinstance(enable, bool):
-            self.warningInfo("Boolean is needed to en-/disable a service")
+            self.log_warning("Boolean is needed to en-/disable a service")
             return
         self.services[name][2] = enable
 
@@ -4793,16 +4854,16 @@ class Server:
             try:
                 service(tuple(self.conns.keys()))
             except (ConnectionResetError, ConnectionAbortedError, OSError):
-               self.logEvent(
+               self.logger.debug(
                    f"Service '{service.__name__}' couldn't be completed")
             except Exception as e:
-               self.errorInfo(f"Error while executing service '{name}': "
+               self.log_error(f"Error while executing service '{name}': "
                                + f"{e}")
-               self.warningInfo(f"Service '{name}' is now disabled")
+               self.log_warning(f"Service '{name}' is now disabled")
                self.services[name][2] = False
 
         if self.services_active:
-            self.warningInfo("Services are already running")
+            self.log_warning("Services are already running")
             return
         if services_thread:
             Thread(name='services',
@@ -4810,9 +4871,10 @@ class Server:
                    args=(routine_pause, False,)
             ).start()
             return
-
         self.services_active = True
-        self.statusInfo("Started services")
+        self._services_stopped_event.clear()
+
+        self.log_info("Started services")
         while self.se_running and self.services_active:
             # Start thread services
             for name, properties in self.services.items():
@@ -4834,7 +4896,9 @@ class Server:
 
             sleep(routine_pause)
 
-        self.statusInfo("Ended services")
+        self.services_active = False
+        self._services_stopped_event.set()
+        self.log_info("Ended services")
 
     def pingSocket(self, clientsocket: socket) -> float:
         """Measures transmission time for a socket.
@@ -5019,7 +5083,7 @@ class Server:
         """
 
         if (username, socket, addr).count(None) < 2:
-            self.warningInfo(
+            self.log_warning(
                 "Only one argument should be passed to get the ID of a client")
         for conn_id in self.conns:
             if username is not None \
@@ -5068,7 +5132,7 @@ class Server:
                     sock: Optional[socket] = None,
                     port: Optional[int] = None
                     ) -> tuple[socket, bool, bool, str]:
-        """Gets data of a serversock through one property of it.
+        """Gets data of the server-/datasock through a property of it.
 
         ...
 
@@ -5292,6 +5356,8 @@ class Server:
         - Used for the 's.help()' servercommand.
         - Optional parameters are marked with *[o]* and repeatable ones
         with *[r]*.
+        - `rich` parses brackets as commands so a backslash is needed
+        before the repeatable and optional arguments *(`\[o]`)*
 
         ---
         Examples
@@ -5321,11 +5387,11 @@ class Server:
         if commandname not in self.se_commands:
             return "(*No info*)"
         all_args = list(self.se_commands[commandname][3:6])
-        all_args[1] = [f'{o_arg}[o]' for o_arg in all_args[1]]
-        if f"{all_args[2]}[o]" in all_args[1]:
-            all_args[1][-1] += '[r]'
+        all_args[1] = [f'{o_arg}\[o]' for o_arg in all_args[1]]  #type: ignore
+        if f"{all_args[2]}\[o]" in all_args[1]:  #type: ignore
+            all_args[1][-1] += '\[r]'  #type: ignore
         elif all_args[2] is not None:
-            all_args[1].append(f"{all_args[2]}[r]")
+            all_args[1].append(f"{all_args[2]}\[r]")  #type: ignore
         return f"({', '.join(all_args[0] + all_args[1])})"  # type: ignore
 
     def _get_infotext_server(self, admin_text: bool) -> str:
@@ -5345,12 +5411,13 @@ class Server:
         ---
         Returns
         -------
-        str: *ANSI* and line formatted text about the server state
+        str: Formatted text about the server state
         """
 
-        info_text = "\033[1;4mSERVERINFO\033[0;1m:\033[0m"
+        info_text = self.text_header_format("SERVERINFO:")
         info_text += ("\n  name: " + self.username
                     + "\n  description: " + self.description
+                    + f"\n  server type: '{type(self).__name__}'"
                     + "\n  server version: " + Server.__version__
                     + "\n  runtime: "
                     + str(int((time() - self._starttime) / 60))
@@ -5359,10 +5426,10 @@ class Server:
                     + "\n  port: " + str(self.addr[1])
                     + "\n  network layer: " + str(self.layer))
         if admin_text:
-            info_text += "\n\n  \033[1mSERVICES:\033[0m"
+            info_text += f"\n\n  [underline]SERVICES:[/underline]"
             if not self.services_active:
                 info_text += "\n    "
-                info_text += "\033[3mServices routine is not running\033[0m"
+                info_text += "Services routine is not running"
             else:
                 for name, prop in self.services.items():
                     info_text += f"\n    {name}: "
@@ -5372,19 +5439,21 @@ class Server:
                             info_text += " (called as thread)"
                     else:
                         info_text += "disabled"
-            info_text += "\n\n  \033[1mTHREADS:\033[0m " + str(
+            info_text += "\n\n  [underline]THREADS:[/underline] " + str(
                 len([th for th in thread_enumerate() if th.is_alive()]))
             thread_list = thread_enumerate()
             thread_list.sort(key=lambda thread_obj: thread_obj.name)
             for thread in thread_list:
                 info_text += ("\n    " + thread.name +
                               "  running" if thread.is_alive() else "")
-            info_text += "\n\n  SOCKETS: " + str(len(self.serversocks))
+            info_text += "\n\n  [underline]SOCKETS:[/underline] "
+            info_text +=  str(len(self.serversocks))
             for sockname, sockdata in self.serversocks.items():
                 info_text += (f"\n    {sockname}("
                             + str(sockdata[0].getsockname()[1])
                             + f")  new_clients: {sockdata[1]}")
-        info_text += f"\n\n  \033[1mCONNECTIONS:\033[0m {len(self.conns)}"
+        info_text += f"\n\n  [underline]CONNECTIONS:[/underline]"
+        info_text += f" {len(self.conns)}"
         for conn in self.conns:
             conn = self.conns[conn]
             info_text += (f"\n    {conn['name']}({conn['addr'][0]})  "
@@ -5409,7 +5478,7 @@ class Server:
         ---
         Returns
         -------
-        str: *ANSI* and line formatted text about a user
+        str: Formatted text about a user
         str: Empty string if user doe
         """
 
@@ -5417,7 +5486,7 @@ class Server:
         if id is None:
             return ""
         conn_data = self.conns[id]
-        return ("\033[1;4mUSERINFO\033[0;1m:\033[0m"
+        return (self.text_header_format("USERINFO:")
             + "\n  username: " + conn_data['name']
             + "\n  ip: " + conn_data['addr'][0]
             + "\n  server: " + str(conn_data['isserver'])
@@ -5434,6 +5503,28 @@ class Server:
             + str(int((time()-conn_data['connecttime']) / 60))
             + "min"
             + "\n  layer: " + str(self.layer+1))
+
+    def text_header_format(self, text: str) -> str:
+        """Formats a text with rich commands to be a header.
+
+        ...
+
+        Formats text to a standardized header mainly for informational
+        text returned by a servercommand.
+
+        ---
+        Arguments
+        ---------
+        text: str
+            Header text
+
+        ---
+        Returns
+        -------
+        str: Formatted header text
+        """
+
+        return f"[bold][underline][magenta]{text}[/bold][/underline][/magenta]"
 
     def __str__(self) -> str:
         """Values returned when converting to string.
@@ -5456,7 +5547,7 @@ class Server:
     # Displaying functions |
     # ---------------------+
 
-    def printInfo(self, message: str, sender: str=""):
+    def text_output(self, message: str, sender: str=""):
         """Outputs a client message.
 
         ...
@@ -5472,28 +5563,23 @@ class Server:
         ---
         See Also
         --------
-        connectionInfo : Outputs a connection information
-        statusInfo : Outputs a state of the server
-        warningInfo : Outputs a warning
-        errorInfo : Outputs an error
-        logEvent : Logs an events
+        log_connection_info : Outputs a connection information
+        log_info : Outputs a state of the server
+        log_warning : Outputs a warning
+        log_error : Outputs an error
 
         ---
         Notes
         -----
         - The messages get received on the serversock.
-        - If *ANSI* formatting is enabled, the message can be colored.
+        - The message can contain *ansi* formatting codes.
         """
+        if sender:
+            print(f"{sender}: {message}")
+        else:
+            print(message)
 
-        if sender != "":
-            message = f"\033[1;4m{sender}\033[0;1m\033[0m{message}"
-        if not self._ansi:
-            message = compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])').sub(
-                              '', message)
-        print(message)
-        self.logEvent(message)
-
-    def connectionInfo(self, info: str):
+    def log_connection_info(self, info: str):
         """Outputs information regarding connections.
 
         ...
@@ -5507,27 +5593,15 @@ class Server:
         ---
         See Also
         --------
-        printInfo : Outputs a client message
-        statusInfo : Outputs a state of the server
-        warningInfo : Outputs a warning
-        errorInfo : Outputs an error
-        logEvent : Logs an events
-
-        ---
-        Notes
-        -----
-        - If *ANSI* is allowed, the printed info gets colored.
+        text_output : Outputs a client message
+        log_info : Outputs a state of the server
+        log_warning : Outputs a warning
+        log_error : Outputs an error
         """
 
-        if self._ansi:
-            print(f"\033[38;5;230m{info}\033[0m")
-        else:
-            info = compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])').sub(
-                           '', info)
-            print(info)
-        self.logEvent(f"CONNECTION: {info}")
+        self.logger.info(info)
 
-    def statusInfo(self, status: str):
+    def log_info(self, status: str):
         """Outputs states of the server and logs the event.
 
         ...
@@ -5541,27 +5615,15 @@ class Server:
         ---
         See Also
         --------
-        printInfo : Outputs a client message
-        connectionInfo : Outputs a connection information
-        warningInfo : Outputs a warning
-        errorInfo : Outputs an error
-        logEvent : Logs an events
-
-        ---
-        Notes
-        -----
-        - If *ANSI* codes are allowed the status will be displayed gray.
+        text_output : Outputs a client message
+        log_connection_info : Outputs a connection information
+        log_warning : Outputs a warning
+        log_error : Outputs an error
         """
 
-        if self._ansi:
-            print(f"\033[38;5;243m{status}\033[0m")
-        else:
-            status = compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])').sub(
-                             '', status)
-            print(status)
-        self.logEvent(f"STATUS: {status}")
+        self.logger.info(status)
 
-    def warningInfo(self, warning: str):
+    def log_warning(self, warning: str):
         """Outputs a warning and logs the event.
 
         ...
@@ -5575,28 +5637,15 @@ class Server:
         ---
         See Also
         --------
-        printInfo : Outputs a client message
-        connectionInfo : Outputs a connection information
-        statusInfo : Outputs a state of the server
-        errorInfo : Outputs an error
-        logEvent : Logs an events
-
-        ---
-        Notes
-        -----
-        - If *ANSI* formatting is allowed, the warning will be orange.
+        text_output : Outputs a client message
+        log_connection_info : Outputs a connection information
+        log_info : Outputs a state of the server
+        log_error : Outputs an error
         """
 
-        if self._ansi:
-            print("\033[38;5;214m\033[1;4mWAR:\033[0;1m\033[38;5;214m " + \
-                  warning + "\033[0m")
-        else:
-            warning = compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])').sub(
-                              '', warning)
-            print(f"WAR: {warning}")
-        self.logEvent(f"WARNING: {warning}")
+        self.logger.warning(warning)
 
-    def errorInfo(self, error: str):
+    def log_error(self, error: str):
         """Outputs an error and logs the event.
 
         ...
@@ -5610,69 +5659,42 @@ class Server:
         ---
         See Also
         --------
-        printInfo : Outputs a client message
-        connectionInfo : Outputs a connection information
-        statusInfo : Outputs a state of the server
-        warningInfo : Outputs a warning
-        logEvent : Logs an events
-
-        ---
-        Notes
-        -----
-        - If *ANSI* formatting is allowed, the error gets colored red.
+        text_output : Outputs a client message
+        log_connection_info : Outputs a connection information
+        log_info : Outputs a state of the server
+        log_warning : Outputs a warning
         """
 
-        if self._ansi:
-            print(f"\033[91;1;4mERR:\033[0;1;91m {error}\033[0m")
-        else:
-            error = compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])').sub(
-                            '', error)
-            print(f"ERR: {error}")
-        self.logEvent(f"ERROR: {error}")
+        self.logger.error(error)
 
-    def logEvent(self, event: str):
-        """Saves events and writes them into a logfile (if available).
-
+    def panel_output(self, text: str, header: str="",
+                     border_style: str="white"):
+        """Highlights important information with a border
         ...
 
-        ---
-        Parameters
-        ---------
-        event : str
-            Event information that gets stored
+        Uses `rich.Panel` to surround the text with a border. This can
+        be used to highlight important statements. Note that this action
+        will not be logged.
 
         ---
-        See Also
-        --------
-        printInfo : Outputs a client message
-        connectionInfo : Outputs a connection information
-        statusInfo : Outputs a state of the server
-        warningInfo : Outputs a warning
-        errorInfo : Outputs an error
+        Parameter
+        ---------
+        text : str
+            Information to display
+        header : str, optional
+            Title name of the panel
+        border_style: str, optional
+            Style and color of the panel
 
         ---
         Notes
         -----
-        - All implemented outputs log their events.
+        - Rich styling commands can be inserted into **text**.
+
         """
 
-        event = compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])').sub('',
-                        event)
-        event = f"{datetime.now().strftime('%H:%M:%S:%f')}>  {event}\n"
-        self._log.append(event)
-        if self.logfile != '':
-            with open(self.logfile, 'a') as log:
-                log.write(event)
-        # Warn about log size
-        if len(self._log) % 10_000 == 0 and len(self._log) > 200_000:
-            if not self.logfile == '':
-                self._log = []
-                self.statusInfo(
-                    f"Clearing internal log (size: {len(self._log)}) since "
-                    + f"events get stored to '{self.logfile}'")
-            else:
-                self.warningInfo(
-                    "Log holds many entries. Consider storing to a file.")
+        self.rich_console.print(Panel(text, expand=False,
+                                      border_style=border_style, title=header))
 
 
 class SubServer(Server, Client):
@@ -5683,7 +5705,7 @@ class SubServer(Server, Client):
     A `SubServer` is the combination of a `Client` and a `Server` used
     as a network node. Clients can connect to it *(like to a server)*
     and itself can connect to other servers *(like a client)*. The
-    server a subserver connects to is referred to as the *higher
+    server a subserver connects to is referred to as the *parent
     server*. Subserver provide additional *client-/servercommands* and
     *requestables*.
 
@@ -5704,14 +5726,14 @@ class SubServer(Server, Client):
     with 'cl_*'.
     """
 
-    __version__ = '4.17.075'
+    __version__ = '4.17.076'
 
     def __init__(self, servername: str = 'subserver',
                  preferredport: int | str | Iterable = '>4000',
                  preferreddataport: int | str | Iterable ='<3999',
                  max_datasize: int = 2048, adminkey: str = '',
                  description: str = "None", logfile: str = '',
-                 ansi :bool = True, *args,**kwargs):
+                 start_server : bool = False, *args,**kwargs):
         """...
 
         ---
@@ -5731,8 +5753,8 @@ class SubServer(Server, Client):
             Short description of the subserver
         logfile : str
             Path to file that stores occurred events
-        ansi : bool
-            Allow *ANSI* text formatting
+        start_server : bool
+            Start the server
 
         ---
         See Also
@@ -5750,8 +5772,7 @@ class SubServer(Server, Client):
             self,
             username=servername,
             description=description,
-            logfile='',
-            ansi=ansi)
+            logfile='')
         Server.__init__(
             self,
             servername=servername,
@@ -5761,9 +5782,11 @@ class SubServer(Server, Client):
             description=description,
             max_datasize=max_datasize,
             logfile=logfile,
-            ansi=ansi,
+            start_server=start_server,
             args=args,
             kwargs=locals() | kwargs)
+        self.logger.debug(
+            f"Client ({Client.__version__}|{self._conntype}) loaded")
         self._conntype = 'SUBSERVER'
 
         SubServer._initClientRequestables(self)
@@ -5802,13 +5825,13 @@ class SubServer(Server, Client):
         """
 
         if self.se_running:
-            self.statusInfo("Subserver is already running")
+            self.log_info("Subserver is already running")
             return
         Server.startServer(self, port, dataport, maindatasock, services)
-        self.statusInfo(f"Subserver '{self.username}' operational")
+        self.log_info(f"Subserver '{self.username}' operational")
 
     def shutdownServer(self):
-        """Disconnects the *higher server* and shuts the server down.
+        """Disconnects from the *parent server* and shuts the server down.
 
         ...
 
@@ -5819,7 +5842,7 @@ class SubServer(Server, Client):
 
         """
 
-        self.statusInfo("Disconnecting from higher server")
+        self.log_info("Disconnecting from parent server")
         self.disconnect()
         Server.shutdownServer(self)
 
@@ -5841,7 +5864,7 @@ class SubServer(Server, Client):
         -----
         - This does not initiate any requestables of the parent class
         `Client`.
-        - Client *requestables* are called by the *higher server*.
+        - Client *requestables* are called by the *parent server*.
         - The server/subserver also has (server) *requestables* which
         can be called by clients.
         """
@@ -5888,7 +5911,7 @@ class SubServer(Server, Client):
         -----
         - This does not initiate any clientcommand of the parent class
         `Client`.
-        - These commands get called by the *higher server*.
+        - These commands get called by the *parent server*.
         """
 
         def setlayer(layer):
@@ -5924,8 +5947,8 @@ class SubServer(Server, Client):
 
         Initiated servercommands:
         *([o]: optional arguments, [r]: repeatable argument)*
-        - s.connecttohigher()
-        - s.sethigherserver(ip, port)
+        - s.connecttoparent()
+        - s.setparentserver(ip, port)
         - s.info(username[o][r]), overwritten
         - s.attributes(), overwritten
 
@@ -5942,7 +5965,7 @@ class SubServer(Server, Client):
         - These commands can be called by clients.
         """
 
-        def connecttohigher(clientid):
+        def connecttoparent(clientid):
             if self.connected:
                 self.sendCommandTo(self.mainSocketof(clientid), 'connect',
                                    self.connected_addr)
@@ -5951,9 +5974,9 @@ class SubServer(Server, Client):
                 self.mainSocketof(clientid).close()
             else:
                 self.sendMsgTo(
-                    clientid, "Subserver has no connected higher server")
+                    clientid, "Subserver has no parent server")
 
-        def sethigherserver(clientid, args):
+        def setparentserver(clientid, args):
             try:
                 args[1] = int(args[1])
             except ValueError:
@@ -5964,27 +5987,27 @@ class SubServer(Server, Client):
                 return
             cl_data = self.conns[clientid]['data']
             if not self.connected \
-            or 'connect_higher_ack' in cl_data \
-            and cl_data['connect_higher_ack'] >= time() - 30.0:
+            or 'connect_parent_ack' in cl_data \
+            and cl_data['connect_parent_ack'] >= time() - 30.0:
                 connect_status = self.connect((args[0], int(args[1])))
                 if connect_status == 'Connected':
                     self.sendMsgTo(
-                        clientid, "Server connected to higher Server '"
+                        clientid, "Server connected to parent Server '"
                         + self.cl_serverdata['servername'] + "'")
                 else:
-                    self.sendMsgTo(clientid, "Connect result: "
-                                   + connect_status)
+                    self.sendMsgTo(clientid,
+                                   f"Connect result: {connect_status}")
                 return
-            elif 'connect_higher_ack' in cl_data:
+            elif 'connect_parent_ack' in cl_data:
                 self.sendMsgTo(
                     clientid,
                     "The Server is currently connected to '"
                     + self.cl_serverdata['servername'] + "'")
-            self.conns[clientid]['data']['connect_higher_ack'] = time()
+            self.conns[clientid]['data']['connect_parent_ack'] = time()
             self.sendMsgTo(
                 clientid,
                 "Confirm connecting to a new address by sending "
-                + f"'s.sethigherserver({args[0]}, {args[1]})'")
+                + f"'s.setparentserver({args[0]}, {args[1]})'")
 
         def info(clientid, args):
             # Info of servers
@@ -5995,11 +6018,11 @@ class SubServer(Server, Client):
                 text = text.split("\n\n")
                 if self.connected:
                     text.insert(2,
-                        "  Higher server: " + self.cl_serverdata['servername']
-                        + "\n  Higher addr: " + str(self.connected_addr))
+                        "  parent server: " + self.cl_serverdata['servername']
+                        + "\n  parent addr: " + str(self.connected_addr))
                 else:
                     text.insert(2,
-                                "  Higher server: \033[1mNot connected\033[0m")
+                                "  parent server: Not connected")
                 text = "\n\n".join(text)
 
                 self.sendMsgTo(clientid, text)
@@ -6016,7 +6039,7 @@ class SubServer(Server, Client):
                         self.sendMsgTo(clientid, f"No user '{a}'")
 
         def attributes(clientid):
-            send_text = f"\033[1mAttributes of '{self.username}':\033[0m"
+            send_text = f"Attributes of '{self.username}':"
             send_text += "\n  Separator: " + self._se_sep
             send_text += "\n  Max datasize: " + str(self.se_max_datasize)
             send_text += "\n\n  Serverdata:"
@@ -6041,20 +6064,20 @@ class SubServer(Server, Client):
 
         # User management
         self.newServerCommand(
-            's.connecttohigher',
-            "Connects the client to the higher server layer",
-            lambda id, args: connecttohigher(id),
+            's.connecttoparent',
+            "Connects the client to the parent server",
+            lambda id, args: connecttoparent(id),
             category='user management')
         self.newServerCommand(
             's.cth',
-            "Short form of 's.connecttohigher'",
-            lambda id, args: connecttohigher(id),
+            "Short form of 's.connecttoparent'",
+            lambda id, args: connecttoparent(id),
             category='user management')
 
         # Server management
         self.newServerCommand(
-            's.sethigherserver', "Connects the server to a higher server",
-            lambda id, args: sethigherserver(id, args),
+            's.setparentserver', "Connects the server to another server",
+            lambda id, args: setparentserver(id, args),
             args=['ip', 'port'],
             needed_permission='admin',
             category='server management')
@@ -6079,7 +6102,7 @@ class SubServer(Server, Client):
     # -----------------------------+
 
     def disconnect(self):
-        """Terminates connection with the higher server.
+        """Terminates connection with the parent server.
 
         ...
 
@@ -6090,12 +6113,12 @@ class SubServer(Server, Client):
         """
 
         if self.connected:
-            self.statusInfo("Disconnecting from higher Server")
+            self.log_info("Disconnecting from parent Server")
         Client.disconnect(self)
 
     def connect(self, addr: tuple[str, int] = ('', -1),
-                autoconnect: bool = False, timeout: float = 1.0) -> str:
-        """Connects the subserver to a *higher server*.
+                autoconnect: bool = False, timeout: float = 1.0) -> int | socket:
+        """Connects the subserver to a *parent server*.
 
         ...
 
@@ -6112,12 +6135,15 @@ class SubServer(Server, Client):
         ---
         Returns
         -------
-        str : A string from `Client.connect()`
+        int : Status result of `Client._setup_connect()`
+        int : Additional status results:
+            `-2` : No server on address(es) / Connect dddr is own addr
 
         ---
         See Also
         --------
         Client.connect : Connects the client with a server
+        Client._setup_connect : Manages the connection attempt
 
         ---
         Notes
@@ -6130,25 +6156,27 @@ class SubServer(Server, Client):
         Examples
         --------
         >>> ss.connect(autoconnect=True)
+        2
 
         >>> ss.connect(('192.168.178.140', 4000))
 
-        >>> ss.connect((192.168.178.140, 4001), True, 1.5)
+
+        >>> ss.connect((192.168.178.140, 4001), True, timeout=0)
+        -1
         """
 
-        if not self.se_running:
-            return 'Server is not started'
         if addr == self.addr:
-            return "Can't connect to own address"
-        info = Client.connect(self, addr, autoconnect, timeout)
-        if info == 'Connected':
+            return -2
+        state = Client.connect(self, addr, autoconnect=autoconnect,
+                               timeout=timeout)
+        if state == 2:
             for conn_id in self.conns:
                 self.sendCommandTo(self.mainDataSockOf(conn_id), 'setlayer',
                                    [self.layer + 1])
-        return info
+        return state
 
     def recvServerMessage(self):
-        """Receives messages from the *higher server*.
+        """Receives messages from the *parent server*.
 
         ...
 
@@ -6159,7 +6187,7 @@ class SubServer(Server, Client):
 
         Client.recvServerMessage(self)
         for conn_id in self.conns:
-            self.sendMsgTo(conn_id, "Lost connection with higher Server")
+            self.sendMsgTo(conn_id, "Lost connection with parent server")
 
     def recvUserMessages(self, clientid: str, sock: socket):
         """Receives data from a clientsocket.
@@ -6183,7 +6211,7 @@ class SubServer(Server, Client):
         if not self.connected:
             self.sendMsgTo(
                 clientid,
-                f"SubServer '{self.username}' is not connected to a higher "
+                f"SubServer '{self.username}' is not connected to a parent "
                 + "Server")
         Server.recvUserMessages(self, clientid, sock)
 
@@ -6208,11 +6236,11 @@ class SubServer(Server, Client):
         """
 
         data = Server.getServerData(self)
-        data['higher_addr'] = self.connected_addr
+        data['parent_addr'] = self.connected_addr
         return data
 
     def getClientData(self) -> dict:
-        """Returns data that is sent to the higher server.
+        """Returns data that is sent to the parent server.
 
         ...
 
@@ -6262,7 +6290,7 @@ class MainServer(Server):
     def __init__(self, preferredport: int | str | Iterable[int] = 4000,
                  preferreddataport: int | str | Iterable[int] = '<3999',
                  max_datasize: int = 4096, adminkey: str = '',
-                 logfile: str = '', ansi :bool = True):
+                 logfile: str = '', start_server: bool=False):
         """...
 
         ---
@@ -6278,8 +6306,6 @@ class MainServer(Server):
             Password to gain admin permissions
         logfile : str
             Path of file that stores occurred events
-        ansi : bool
-            Allow *ANSI* text formatting
 
         ---
         See Also
@@ -6295,12 +6321,14 @@ class MainServer(Server):
             adminkey=adminkey,
             description="Main control node",
             max_datasize=max_datasize,
-            logfile=logfile,
-            ansi=ansi
+            logfile=logfile
         )
 
         MainServer._initServercommands(self)
-        self.logEvent(f"Mainserver ({MainServer.__version__}) loaded")
+        self.logger.debug(f"Mainserver ({MainServer.__version__}) loaded")
+
+        if start_server:
+            self.startServer()
 
     def _initServercommands(self):
         """Initiates additional mainserver servercommands.
@@ -6348,7 +6376,8 @@ class MainServer(Server):
             # String format structure
             info_str = "All connected instances in the network:\n"
             info_str += "\n" + structure[0]
-            info_str += self._formatNetworkList(tuple(structure))
+            info_str += self._formatNetworkList(
+                tuple(structure))  # type: ignore
 
             self.sendMsgTo(clientid, info_str)
 
@@ -6483,10 +6512,10 @@ class MainServer(Server):
         """
 
         if self.se_running:
-            self.statusInfo("Mainserver is already running")
+            self.log_info("Mainserver is already running")
         Server.startServer(self, self.preferredport, self.preferreddataport,
                            True, True)
-        self.statusInfo("Mainserver operational")
+        self.log_info("Mainserver operational")
 
     def _formatNetworkList(self, network: tuple[str, list[Any], list[str]],
                           last: bool=True, prefix: str="") -> str:
