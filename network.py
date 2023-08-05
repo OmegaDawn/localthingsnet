@@ -80,7 +80,7 @@ from rich import print
 
 
 __version__ = '1.1.0'
-__date__ = '2023/08/02'
+__date__ = '2023/08/05'
 __author__ = 'Laurenz Nitsche'
 
 
@@ -103,9 +103,6 @@ class Client:
     ---
     Attributes
     ----------
-    autoconnect_addrs : list
-        Addresses that are/were used by a server
-        list[tuple[ip:str, port:int]]
     cl_commands : dict
         All available clientcommands
         dict[name:str, tuple[func:Callable, call_as_thread:bool]]
@@ -128,6 +125,9 @@ class Client:
         Short information text about the client
     ip : str
         IP of the client
+    known_server : list
+        All (active) server the client knows about
+        list[tuple[tuple[str, int], float], str]
     layer : int
         Depth layer in the network
     logfile : str
@@ -145,7 +145,7 @@ class Client:
     _connecttime : float
         Time the client established a connection to a server
     _conntype : str
-        Application type of the client
+        Client type / Class name
     _open_requests : dict
         Unanswered data requests
         dict[id:str, request_or_data:object]
@@ -183,7 +183,7 @@ class Client:
     >>> c.disconnect()
     """
 
-    __version__ = '6.27.141'
+    __version__ = '6.27.143'
 
     def __init__(self, username: str = '', description: str = "None",
                  logfile: str = ''):
@@ -220,12 +220,12 @@ class Client:
         self.cl_commands: dict[str, tuple[Callable, bool]] = {}
         self.cl_requestables: dict[str, object] = {}
         self.cl_serverdata: dict[str, Any] = {}
-        self.autoconnect_addrs: list[tuple[str, int]] = []
+        self.known_server: list[tuple[tuple[str, int], float]] = []
         self._open_requests: dict[str, object] = {}
         self._starttime: float = time()
         self._connecttime: float = 0.0
         self._connecting: bool = False
-        self._conntype: str = 'CLIENT'
+        self._conntype: str = type(self).__name__
 
         # Variables that get set with a connection
         self.connected: bool = False
@@ -589,7 +589,7 @@ class Client:
 
     def searchServer(self, ports: int | Iterable[int] = range(4000, 4005),
                      ips: str  | Iterable[str] = 'locals',
-                     only_one: bool = False, add_to_autoconnect: bool = True,
+                     only_one: bool = False, add_to_known: bool = True,
                      timeout: float = 0.025) -> list[tuple[str, int]]:
         """Searches for active servers in the same network.
 
@@ -611,8 +611,8 @@ class Client:
             Search on these ip addresses
         only_one : bool, optional
             Return after the first server is found
-        add_to_autoconnect: bool, optional
-            Automatically save addresses for *autoconnect* attempts
+        add_to_known: bool, optional
+            Save found server for *autoconnect* attempts
         timeout: float, optional
             Timeout for the search
 
@@ -628,10 +628,10 @@ class Client:
         searched. This may take a few seconds to go though all ports on
         256 IP addresses. It is recommended to use the **ips** parameter
         to narrow the search range to only a few IPs.
-        - With **add_to_autoconnect** the found server addresses will
-        become "known addresses". When `connect(autoconnect=True)` is
-        called the server tries to connect to any of these previously
-        found addresses.
+        - With **add_to_known** the found server addresses will become
+        "known addresses". When `connect(autoconnect=True)` is called
+        the server tries to connect to any of these previously found
+        addresses.
         - *serversocks* are the mainly used socket of servers and
         *datasocks* are secondary sockets for data transfer.
         - Increasing the timeout drastically increases the search time.
@@ -643,7 +643,7 @@ class Client:
         >>> c.searchForServer(range(4000, 4010), only_one=True)
         [('192.168.178.140', 4000)]
 
-        >>> c.searchForServer(ports=[4000, 4001], ips=['192.168.178.140'])
+        >>> c.searchForServer(ports=[4000,4001],ips=['192.168.178.140'])
         [('192.168.178.140', 4000), ('192.168.178.140', 4001)]
 
         >>> c.searchForServer((4000, 4001), log_info=True)
@@ -659,11 +659,8 @@ class Client:
 
         # Thread that searches for servers on a certain port
         def searchPortOnAddress(self, for_ips, on_port):
-            class ServerFinder(Client):
-                def __init__(self, *args, **kwargs):
-                    super().__init__()
+            class ServerFinder(Client): pass
             c = ServerFinder()
-            c._conntype = 'SERVERFINDER'
             c.logger = getLogger("dummy")
             def mute(client, arg1, arg2=None, arg3=None): pass
             c.text_output = mute.__get__(c, Client)
@@ -681,7 +678,7 @@ class Client:
                 if only_one and len(found_servers) > 0:
                     break
                 if info == 1:
-                    found_servers.append((ip, on_port))
+                    found_servers.append([(ip, on_port), time(), '*unknown*'])
                     self.logger.debug(f"Found Server on {ip} at {on_port}")
             del c
 
@@ -717,10 +714,12 @@ class Client:
                 thread.join()
                 progress.update(task, advance=1)
             progress.remove_task(task)
-        if add_to_autoconnect:
-            for addr in found_servers:
-                if addr not in self.autoconnect_addrs:
-                    self.autoconnect_addrs.append(addr)
+        if add_to_known:
+            for found_server in found_servers:
+                if found_server[0] not in [s[0] for s in self.known_server]:
+                    self.known_server.append(found_server)
+                else:
+                    pass  # If the server is already known, don't update it
         self.log_info(f"Server search found {len(found_servers)} server")
         return found_servers
 
@@ -762,7 +761,7 @@ class Client:
             if time() - started > 1.5:
                 self.log_error("Failed to correctly disconnect the client")
                 return
-        if self._conntype != 'SERVERFINDER':
+        if self._conntype != 'ServerFinder':
             if was_connected:
                 if servername != '':
                     self.log_info(
@@ -824,7 +823,7 @@ class Client:
             status = self.rich_console.status(
                 "[cyan]Establishing connection")
             # Create a dummy status for serverfinder (prevents flickering)
-            if self._conntype == 'SERVERFINDER':
+            if self._conntype == 'ServerFinder':
                 class StatusDummy:
                     def __enter__(self): return self
                     def __exit__(self, exc_type, exc_val, exc_tb): pass
@@ -866,12 +865,17 @@ class Client:
                        name='Recv_Server').start()
                 sock.send('continue'.encode())  # Ends server side registration
 
-                # Add addr to autoconnect
-                if not [entry for entry in self.autoconnect_addrs \
-                        if entry is self.connected_addr]:
-                    self.autoconnect_addrs.append((
-                        self.connected_addr[0],
-                        self.connected_addr[1]))
+                # Add server to known server
+                if self.connected_addr in [s[0] for s in self.known_server]:
+                    for i, server in enumerate(self.known_server):
+                        if server[0] == self.connected_addr:
+                            self.known_server[i][1] = time()
+                            self.known_server[i][2] = \
+                                self.cl_serverdata['servername']
+                else:
+                    self.known_server.append(
+                        [self.connected_addr, time(),
+                        self.cl_serverdata['servername']])
 
                 # Await maindatasock (if available)
                 socknames = [sock[0] for sock in self.cl_serverdata['socks']]
@@ -928,7 +932,7 @@ class Client:
         -----
         - Arguments should always be passed as key word arguments.
         - Addresses of known servers for *autoconnect* can be gained
-        with `searchForServer()` and are stored in `autoconnect_addrs`.
+        with `searchForServer()` and are stored in `known_server`.
         - Direct connect can not lead to a timeout error.
 
         ---
@@ -978,7 +982,7 @@ class Client:
         ...
 
         The Client starts multiple connect attempts in parallel for all
-        addresses in the `autoconnect_addrs` list. The first server that
+        addresses in the `known_server` list. The first server that
         accepts the client is used. It is non-deterministic which
         address will be connected to and therefore autoconnect should
         be used if it doesn't matter which server is used.
@@ -1011,7 +1015,7 @@ class Client:
         Notes
         -----
         - During the process multiple 'check' threads are started, one
-        for each address in `autoconnect_addrs`.
+        for each address in `known_server`.
 
         ---
         Examples
@@ -1027,14 +1031,14 @@ class Client:
         """Backend autoconnect. Use `Client.autoConnect()` instead.
         """
 
-        if len(self.autoconnect_addrs) == 0:
+        if len(self.known_server) == 0:
             self.log_info("No IPs for autoconnect")
             return 0
 
         self._autoconnect_connect_event = Event()
         self._autoconnect_shared_var = True
         self.logger.debug("Starting autoconnect threads")
-        for addr in self.autoconnect_addrs:
+        for addr in [server[0] for server in self.known_server]:
             Thread(
                 target=self._parallel_connect_attempt,
                 args=(addr,),
@@ -1395,12 +1399,12 @@ class Client:
                         if self.getPort(sock) == self.connected_addr[1]:
                             sender = (
                                 f"[{datetime.now().strftime('%H:%M:%S')}]"
-                                + f"{self.cl_serverdata['servername']}> ")
+                                + f"{self.cl_serverdata['servername']}")
                         else:
                             sender = (
                                 f"[{datetime.now().strftime('%H:%M:%S')}]"
                                 + f"{self.cl_serverdata['servername']}"
-                                + f"({sock.getpeername()[1]})> ")
+                                + f"({sock.getpeername()[1]})")
                         self.text_output(data, sender)
                     else:
                         self.log_warning("Received unprocessable data at a"
@@ -1642,7 +1646,8 @@ class Client:
         return {'description': self.description,
                 'username': self.username,
                 'client_version': Client.__version__,
-                'conntype': type(self).__name__,
+                'conntype': self._conntype,
+                'isserver': False,
                 'commands': list(self.cl_commands.keys()),
                 'requestables': list(self.cl_requestables.keys())}
 
@@ -1725,7 +1730,7 @@ class Client:
         """
 
         if not sender:
-            print(f"{sender}: {message}")
+            print(f"{sender}>: {message}")
         else:
             print(message)
 
@@ -2001,11 +2006,11 @@ class Server:
     >>> s.shutdownServer()
     """
 
-    __version__ = '7.43.166'
+    __version__ = '7.43.168'
     RESTRICTED_NAMES = [  # In lower case
         'server', 'mainserver', 'subserver', 'parent', 'higher', 'services',
         'info', 'command', 'commands', 'servercommand', 'servercommands',
-        'requestable', 'requestables']
+        'requestable', 'requestables', '*unknown*']
 
     def __init__(self, servername: str = 'server', description: str = "None",
                  adminkey: str = '', max_datasize: int = 1024,
@@ -2087,6 +2092,8 @@ class Server:
         self.layer: int = 0
         self.se_running: bool = False
         self.services_active: bool = False
+        # The separator must be written this way.
+        # Otherwise the network.py file could not be send through the network.
         self._se_sep: str = eval("'<$' + 'SEP' + '$>'")
 
         self._no_user_connected_event = Event()
@@ -2760,11 +2767,11 @@ class Server:
             # Check connection type and version
             conntype, version = client.recv(64).decode().split('|', 1)
             version = version.split('.')
-            if conntype == 'SERVERFINDER':
+            if conntype == 'ServerFinder':
                 self.logger.debug(
                     f"{client_addr[0]} searches server and disconnected")
                 raise ConnectionResetError
-            elif (conntype == 'CLIENT' or conntype == 'SUBSERVER') \
+            elif (conntype == 'Client' or conntype == 'SubServer') \
                     and int(version[0]) < 6 and int(version[1]) < 26:
                 self.logger.debug(f"'{client_addr[0]}' is not compatible")
                 raise ConnectionAbortedError
@@ -2780,7 +2787,9 @@ class Server:
             # Exchange clientdata
             clientdata = (loads(client.recv(4096)))
             username = clientdata['username']
+            isserver = clientdata['isserver']
             del clientdata['username']
+            del clientdata['isserver']
 
             # Validate username
             username_changed_info = ""
@@ -2804,7 +2813,7 @@ class Server:
                 raise ConnectionResetError
 
         except (ConnectionResetError, ConnectionAbortedError, EOFError):
-            if conntype != 'SERVERFINDER':
+            if conntype != 'ServerFinder':
                 self.logger.debug(
                     f"'{client_addr[0]}' disconnected during registration")
             client.close()
@@ -2814,7 +2823,7 @@ class Server:
         conn_entry = {
             'name': username,
             'socks': {self.addr[1]: client},
-            'isserver': conntype == 'SUBSERVER',  # Client is network node
+            'isserver': isserver,  # The connection is a network node
             'addr': client_addr,
             'clientdata': clientdata,  # Metadata sent from the client
             'permissions': ['user'],
@@ -2851,7 +2860,7 @@ class Server:
 
         self.log_connection_info(f"{client_addr[0]} registered as '{username}'")
         self.panel_output(
-            f"[yellow]{self.conns[conn_id]['clientdata']['conntype']} "
+            f"[yellow]{conn_entry['clientdata']['conntype']} "
             + f"[bold][underline]{username}[/bold][/underline] "
             + f"[italic]({client_addr[0]})[/italic] connected",
             "Connection", "yellow")
@@ -3198,7 +3207,7 @@ class Server:
                 # Format normal text
                 else:
                     message = data
-                    self.sendMsgTo(clientid, "Received:" + data)
+                    self.sendMsgTo(clientid, "Received: " + data)
                 self.text_output(
                     message,
                     sender=f"[{datetime.now().strftime('%H:%M:%S')}]"
@@ -4065,7 +4074,8 @@ class Server:
                         self.sendMsgTo(clientid, "Admin permissions needed to"
                                        + " change the name of another client")
             except ValueError as name:
-                self.sendMsgTo(clientid, f"No user '{name}' found")
+                self.sendMsgTo(clientid, f"No user '{args[1]}' found")
+                self.logger.log() #TODO
 
         def getadmin(clientid, args):
             if not args:  # Equal to args == []
@@ -4522,7 +4532,6 @@ class Server:
             optional_args=['entity_name'],
             repeatable_arg='entity_name',
             category='statistic')
-
         self.newServerCommand(
             's.attributes', "Shows useful attributes of the server",
             lambda id, args: attributes(id),
@@ -5415,9 +5424,9 @@ class Server:
         """
 
         info_text = self.text_header_format("SERVERINFO:")
-        info_text += ("\n  name: " + self.username
+        info_text += (f"\n  name: {self.username}"
                     + "\n  description: " + self.description
-                    + f"\n  server type: '{type(self).__name__}'"
+                    + f"\n  server type: {type(self).__name__}"
                     + "\n  server version: " + Server.__version__
                     + "\n  runtime: "
                     + str(int((time() - self._starttime) / 60))
@@ -5489,7 +5498,7 @@ class Server:
         return (self.text_header_format("USERINFO:")
             + "\n  username: " + conn_data['name']
             + "\n  ip: " + conn_data['addr'][0]
-            + "\n  server: " + str(conn_data['isserver'])
+            + "\n  type: " + str(conn_data['conntype'])
             + "\n  description: "
             + conn_data['clientdata']['description']
             + "\n\n  permissions: "
@@ -5726,7 +5735,7 @@ class SubServer(Server, Client):
     with 'cl_*'.
     """
 
-    __version__ = '4.17.076'
+    __version__ = '4.17.078'
 
     def __init__(self, servername: str = 'subserver',
                  preferredport: int | str | Iterable = '>4000',
@@ -5787,7 +5796,7 @@ class SubServer(Server, Client):
             kwargs=locals() | kwargs)
         self.logger.debug(
             f"Client ({Client.__version__}|{self._conntype}) loaded")
-        self._conntype = 'SUBSERVER'
+        self._conntype = type(self).__name__
 
         SubServer._initClientRequestables(self)
         SubServer._initClientcommands(self)
@@ -6018,7 +6027,8 @@ class SubServer(Server, Client):
                 text = text.split("\n\n")
                 if self.connected:
                     text.insert(2,
-                        "  parent server: " + self.cl_serverdata['servername']
+                        "  parent server: '" + self.cl_serverdata['servername']
+                        + "'"
                         + "\n  parent addr: " + str(self.connected_addr))
                 else:
                     text.insert(2,
@@ -6032,7 +6042,7 @@ class SubServer(Server, Client):
                 for a in args:
                     conn = self.getIDof(username=a)
                     if a in ['commands', 'servercommands']:
-                        self.se_commands['s.help'][0](['commands'])
+                        self.se_commands['s.help'][0](clientid, ['commands'])
                     elif conn is not None:
                         self.sendMsgTo(clientid, self._get_infotext_user(a))
                     else:
@@ -6149,8 +6159,8 @@ class SubServer(Server, Client):
         Notes
         -----
         - Addresses of 'known' servers for *autoconnect* can be gained
-        with `searchForServer()` and are stored in the
-        **autoconnect_addrs** list.
+        with `searchForServer()` and are stored in the **known_server**
+        list.
 
         ---
         Examples
@@ -6256,6 +6266,7 @@ class SubServer(Server, Client):
         """
 
         data = {'serveraddr': self.addr}
+        data['isserver'] = True
         return Client.getClientData(self) | data
 
 
